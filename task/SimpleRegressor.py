@@ -5,7 +5,6 @@
   @Author Chris
   @Date 2025/10/15
 """
-import math
 
 import numpy as np
 import torch
@@ -70,26 +69,17 @@ class DiffusionParams:
 
     def __init__(self, step_total_num=200):
         self.step_total_num = step_total_num
-        self.beta = torch.linspace(BETA_START, BETA_END, step_total_num)
-        self.beta = self.beta.to(device)
-        self.alpha = 1.0 - self.beta
-        self.alpha = self.alpha.to(device)
+        self.beta = torch.linspace(BETA_START, BETA_END, step_total_num).to(device)
+        self.alpha = (1.0 - self.beta).to(device)
         self.cumprod_alpha = torch.cumprod(self.alpha, dim=0)
-        self.signal_scale = torch.sqrt(self.cumprod_alpha)
-        self.signal_scale = self.signal_scale.to(device)
-        self.noise_scale = torch.sqrt(1 - self.cumprod_alpha)
-        self.noise_scale = self.noise_scale.to(device)
+        self.signal_scale = torch.sqrt(self.cumprod_alpha).to(device)
+        self.noise_scale = torch.sqrt(1 - self.cumprod_alpha).to(device)
 
 
-# -----------------------------
-# 4) 条件化 MLP 模型（预测 noise ε）
-#    输入：x (条件), noisy y, t embedding
-#    输出：预测 ε_hat (与 y 相同 shape)
-# -----------------------------
-class ConditionalMLP(nn.Module):
+class NoisePredictor(nn.Module):
     def __init__(self, x_dim, hidden=256, time_emb_dim=64):
         super().__init__()
-        self.time_embed = SinusoidalPosEmb(time_emb_dim)
+        self.step_embedder = SinusoidalPosEmb(time_emb_dim)
         # MLP: concat([noisy_y, x, time_emb]) -> MLP -> predict noise
         in_dim = 1 + x_dim + time_emb_dim  # y is scalar -> 1
         self.net = nn.Sequential(
@@ -100,26 +90,41 @@ class ConditionalMLP(nn.Module):
             nn.Linear(hidden, 1)  # predict noise scalar
         )
 
-    def forward(self, noisy_y, x, t):
-        # noisy_y: (B,1), x:(B,x_dim), t:(B,) int
-        te = self.time_embed(t)  # (B, time_emb_dim)
-        inp = torch.cat([noisy_y, x, te], dim=-1)
-        return self.net(inp)  # (B,1) predicted noise
+    def forward(self, diffused_ys, xs, steps):
+        # Embed time step
+        embedd_steps = self.step_embedder(steps)
+        # Concatenate inputs
+        combined_features = torch.cat([diffused_ys, xs, embedd_steps], dim=-1)
+
+        return self.net(combined_features)
 
 
 # -----------------------------
 # 5) 训练与采样辅助函数
 # -----------------------------
-def q_sample(params: DiffusionParams, y0, t, noise=None):
+
+
+"""
+ys: [batch_size, 1]
+steps: [batch_size,]
+noise: [batch_size, 1]
+diffused_ys: [batch_size, 1]
+"""
+
+
+def forward_diffuse(params: DiffusionParams, ys, steps, noises=None):
     # 给定原始 y0 和 t，产生 y_t = sqrt(alpha_bar_t)*y0 + sqrt(1-alpha_bar_t)*epsilon
     # y0: (B,1), t: (B,) ints in [0,T-1]
-    if noise is None:
-        noise = torch.randn_like(y0)
-    a_bar = params.signal_scale[t].view(-1, 1).to(y0.device).to(y0.device)  # (B,1)
-    b_bar = params.noise_scale[t].view(-1, 1).to(y0.device)
-    return a_bar * y0 + b_bar * noise, noise
+    if noises is None:
+        noises = torch.randn_like(ys)
+    signal_scale = params.signal_scale[steps].unsqueeze(-1).to(ys.device)  # (B,1)
+    noise_scale = params.noise_scale[steps].unsqueeze(-1).to(ys.device)
+    diffused_ys = signal_scale * ys + noise_scale * noises
+
+    return diffused_ys, noises
 
 
+# TODO
 @torch.no_grad()
 def p_sample_loop(model, params: DiffusionParams, x_cond, device):
     # x_cond: (B, x_dim)
@@ -160,26 +165,27 @@ def train():
     dataset = SyntheticRegressionDataset(sample_total_num=5000)
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
 
-    model = ConditionalMLP(x_dim=X_DIM, hidden=256, time_emb_dim=64).to(device)
+    model = NoisePredictor(x_dim=X_DIM, hidden=256, time_emb_dim=64).to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
     for epoch in range(TOTAL_EPOCH):
         total_loss = 0.0
-        for xb, yb in loader:
-            xb = xb.to(device)
-            yb = yb.to(device)
-            B = xb.shape[0]
-            # Sample randomly time step for each instance
-            sample_steps = torch.randint(low=0, high=STEP_TOTAL_NUM, size=(B,), device=device, dtype=torch.long)
-            # sample y_t
-            y_t, noise = q_sample(params, yb, sample_steps)
-            # predict noise
-            eps_pred = model(y_t, xb, sample_steps)
-            loss = F.mse_loss(eps_pred, noise)
+        for batch_xs, batch_ys in loader:
+            batch_xs = batch_xs.to(device)
+            batch_ys = batch_ys.to(device)
+            batch_size = batch_xs.shape[0]
+            # Sample randomly Time Step
+            sampled_steps = torch.randint(low=0, high=STEP_TOTAL_NUM, size=(batch_size,), device=device,
+                                          dtype=torch.long)
+            # Diffuse Y
+            batch_diffused_ys, noises = forward_diffuse(params, batch_ys, sampled_steps)
+            # Predict Noise
+            pred_noises = model.forward(batch_diffused_ys, batch_xs, sampled_steps)
+            loss = F.mse_loss(pred_noises, noises)
             opt.zero_grad()
             loss.backward()
             opt.step()
-            total_loss += loss.item() * B
+            total_loss += loss.item() * batch_size
         avg_loss = total_loss / len(dataset)
         print(f"Epoch {epoch + 1}/{TOTAL_EPOCH}  avg_mse_loss: {avg_loss:.6f}")
     return model, params, dataset
