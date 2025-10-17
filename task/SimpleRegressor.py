@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from util.model_helper import SinusoidalPosEmb
+from util.model_helper import SinusoidalPosEmb, ResBlock
 
 # Dataset setting
 X_DIM = 5
@@ -83,9 +83,7 @@ class NoisePredictor(nn.Module):
         in_dim = 1 + x_dim + timestep_emb_dim  # y is scalar -> 1
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
+            ResBlock(hidden),
             nn.Linear(hidden, 1)  # predict noise scalar
         )
 

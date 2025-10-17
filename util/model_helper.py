@@ -32,3 +32,19 @@ class SinusoidalPosEmb(nn.Module):
             embed_seq = F.pad(embed_seq, (0, 1))
 
         return embed_seq
+
+
+class ResBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+            nn.LayerNorm(dim),
+            nn.SiLU(),
+            nn.Linear(dim, dim),
+        )
+
+    def forward(self, x):
+        return x + self.net(x)
