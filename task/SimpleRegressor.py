@@ -35,11 +35,11 @@ class SimpleRegressionDataset(Dataset):
         rng = np.random.RandomState(seed)
         self.x = rng.uniform(-1, 1, size=(sample_total_num, X_DIM)).astype(np.float32)
         self.y = (
-                np.sin(self.x[:, 0])                     # x0 取 sin
-                + 0.5 * self.x[:, 1] ** 2                # x1 二次项
-                - 0.3 * self.x[:, 2]                      # x2 线性项
-                + 0.2 * np.cos(self.x[:, 3] * np.pi)    # x3 cos 非线性
-                + 0.1 * self.x[:, 0] * self.x[:, 4]     # x0*x4 交互项
+                np.sin(self.x[:, 0])  # x0 取 sin
+                + 0.5 * self.x[:, 1] ** 2  # x1 二次项
+                - 0.3 * self.x[:, 2]  # x2 线性项
+                + 0.2 * np.cos(self.x[:, 3] * np.pi)  # x3 cos 非线性
+                + 0.1 * self.x[:, 0] * self.x[:, 4]  # x0*x4 交互项
                 + 0.1 * rng.normal(size=sample_total_num)  # 小高斯噪声
         ).astype(np.float32)
         # [n_samples, ] -> [n_samples, 1]
@@ -76,9 +76,9 @@ class NoisePredictor(nn.Module):
         super().__init__()
         self.timestep_embedder = SinusoidalPosEmb(timestep_emb_dim)
         self.timestep_proj = nn.Sequential(
-            nn.Linear(timestep_emb_dim, timestep_emb_dim*2),
+            nn.Linear(timestep_emb_dim, timestep_emb_dim * 2),
             nn.SiLU(),
-            nn.Linear(timestep_emb_dim*2, timestep_emb_dim)
+            nn.Linear(timestep_emb_dim * 2, timestep_emb_dim)
         )
         in_dim = 1 + x_dim + timestep_emb_dim  # y is scalar -> 1
         self.net = nn.Sequential(
@@ -172,10 +172,9 @@ def train(model, params: DiffusionParams, dataset, device):
     return model, params, dataset
 
 
-def evaluate(model, params: DiffusionParams, device):
+def predict(model, params: DiffusionParams, dataset, device):
     example_num = 20
-    dataset = SimpleRegressionDataset(sample_total_num=example_num, seed=626)
-    data_loader = DataLoader(dataset, batch_size=example_num)
+    data_loader = DataLoader(dataset, batch_size=len(dataset))
 
     model.eval()
     xs, true_ys = next(iter(data_loader))
@@ -185,6 +184,11 @@ def evaluate(model, params: DiffusionParams, device):
         pred_ys = reverse_diffuse(model, params, xs, device=device)
     for i in range(example_num):
         print(f"X: {xs[i].cpu().numpy()}, Pred Y: {pred_ys[i].item():.4f}, True Y: {true_ys[i].item():.4f}")
+
+    return true_ys, pred_ys
+
+
+def evaluate(true_ys, pred_ys):
     mse = F.mse_loss(pred_ys, true_ys)
     rmse = torch.sqrt(mse)
     r2 = 1 - torch.sum((true_ys - pred_ys) ** 2) / torch.sum((true_ys - torch.mean(true_ys)) ** 2)
@@ -202,12 +206,15 @@ def main():
     print(f"Device: {device}")
 
     params = DiffusionParams(step_total_num=STEP_TOTAL_NUM, device=device)
-    dataset = SimpleRegressionDataset(sample_total_num=10000)
+    train_dataset = SimpleRegressionDataset(sample_total_num=10000)
     model = NoisePredictor(x_dim=X_DIM, hidden=256, timestep_emb_dim=64).to(device)
 
-    model, params, dataset = train(model, params, dataset, device)
+    model, params, train_dataset = train(model, params, train_dataset, device)
 
-    evaluate(model, params, device)
+    test_dataset = SimpleRegressionDataset(sample_total_num=20, seed=626)
+    true_ys, pred_ys = predict(model, params, test_dataset, device)
+
+    evaluate(true_ys, pred_ys)
 
 
 if __name__ == "__main__":
