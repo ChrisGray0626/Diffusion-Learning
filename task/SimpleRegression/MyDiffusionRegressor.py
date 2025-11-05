@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from util.model_helper import SinusoidalPosEmb, ResBlock
+from util.model_helper import SinusoidalPosEmb, ResBlock, evaluate
 
 # Dataset setting
 X_DIM = 5
@@ -25,7 +25,7 @@ BETA_START = 1e-4
 BETA_END = 0.02
 
 # Train setting
-TOTAL_EPOCH = 30
+TOTAL_EPOCH = 10
 BATCH_SIZE = 128
 lr = 2e-4
 
@@ -87,9 +87,9 @@ class NoisePredictor(nn.Module):
             nn.Linear(hidden, 1)  # predict noise scalar
         )
 
-    def forward(self, diffused_ys, xs, steps):
+    def forward(self, diffused_ys, xs, timesteps):
         # Embed time step
-        embedd_timesteps = self.timestep_embedder(steps)
+        embedd_timesteps = self.timestep_embedder(timesteps)
         embedd_timesteps = self.timestep_proj(embedd_timesteps)
         # Concatenate inputs
         combined_features = torch.cat([diffused_ys, xs, embedd_timesteps], dim=-1)
@@ -169,7 +169,7 @@ def train(model, params: DiffusionParams, dataset, device):
             total_loss += loss.item() * batch_size
         avg_loss = total_loss / len(dataset)
         print(f"Epoch {epoch + 1}/{TOTAL_EPOCH}  Avg MSE Loss: {avg_loss:.6f}")
-    return model, params, dataset
+    return model
 
 
 def predict(model, params: DiffusionParams, dataset, device):
@@ -188,15 +188,6 @@ def predict(model, params: DiffusionParams, dataset, device):
     return true_ys, pred_ys
 
 
-def evaluate(true_ys, pred_ys):
-    mse = F.mse_loss(pred_ys, true_ys)
-    rmse = torch.sqrt(mse)
-    r2 = 1 - torch.sum((true_ys - pred_ys) ** 2) / torch.sum((true_ys - torch.mean(true_ys)) ** 2)
-    print(f"Evaluation MSE: {mse.item():.6f}")
-    print(f"Evaluation RMSE: {rmse.item():.6f}")
-    print(f"Evaluation R2: {r2.item():.6f}")
-
-
 def main():
     device = 'cpu'
     if torch.cuda.is_available():
@@ -209,7 +200,7 @@ def main():
     train_dataset = SimpleRegressionDataset(sample_total_num=10000)
     model = NoisePredictor(x_dim=X_DIM, hidden=256, timestep_emb_dim=64).to(device)
 
-    model, params, train_dataset = train(model, params, train_dataset, device)
+    model = train(model, params, train_dataset, device)
 
     test_dataset = SimpleRegressionDataset(sample_total_num=20, seed=626)
     true_ys, pred_ys = predict(model, params, test_dataset, device)

@@ -48,3 +48,12 @@ class ResBlock(nn.Module):
 
     def forward(self, x):
         return x + self.net(x)
+
+
+def evaluate(true_ys: torch.Tensor, pred_ys: torch.Tensor):
+    mse = F.mse_loss(pred_ys, true_ys)
+    rmse = torch.sqrt(mse)
+    r2 = 1 - torch.sum((true_ys - pred_ys) ** 2) / torch.sum((true_ys - torch.mean(true_ys)) ** 2)
+    print(f"Evaluation MSE: {mse.item():.6f}")
+    print(f"Evaluation RMSE: {rmse.item():.6f}")
+    print(f"Evaluation R2: {r2.item():.6f}")
