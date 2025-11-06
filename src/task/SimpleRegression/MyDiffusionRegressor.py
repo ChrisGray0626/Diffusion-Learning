@@ -92,9 +92,9 @@ class NoisePredictor(nn.Module):
         embedd_timesteps = self.timestep_embedder(timesteps)
         embedd_timesteps = self.timestep_proj(embedd_timesteps)
         # Concatenate inputs
-        combined_features = torch.cat([diffused_ys, xs, embedd_timesteps], dim=-1)
+        inputs = torch.cat([diffused_ys, xs, embedd_timesteps], dim=-1)
 
-        return self.net(combined_features)
+        return self.net(inputs)
 
 
 def forward_diffuse(params: DiffusionParams, ys, steps, device, noises=None):

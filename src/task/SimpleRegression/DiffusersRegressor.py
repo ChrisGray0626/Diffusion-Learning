@@ -59,11 +59,10 @@ class NoisePredictor(ModelMixin, ConfigMixin):
 
     # register_to_config: Register the arguments  to the model's configuration.
     @register_to_config
-    def __init__(self, x_dim: int, hidden: int = 256, timestep_emb_dim: int = 64):
+    def __init__(self, x_dim: int, hidden_dim: int = 256, timestep_emb_dim: int = 64):
         super().__init__()
         self.x_dim = x_dim
-        self.hidden = hidden
-        self.timestep_emb_dim = timestep_emb_dim
+        self.hidden = hidden_dim
         self.timestep_embedder = SinusoidalPosEmb(timestep_emb_dim)
 
         # Positional timestep embedding similar to standard diffusion MLPs
@@ -75,9 +74,9 @@ class NoisePredictor(ModelMixin, ConfigMixin):
 
         in_dim = 1 + x_dim + timestep_emb_dim
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            ResBlock(hidden),
-            nn.Linear(hidden, 1),
+            nn.Linear(in_dim, hidden_dim),
+            ResBlock(hidden_dim),
+            nn.Linear(hidden_dim, 1),
         )
 
     def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
@@ -101,7 +100,7 @@ def build_scheduler():
     return scheduler
 
 
-def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, device: str):
+def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: SimpleRegressionDataset, device: str):
     data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
@@ -115,12 +114,12 @@ def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, dev
             batch_size = batch_xs.shape[0]
 
             # Sample random timesteps uniformly
-            sampled_timesteps = torch.randint(0, scheduler.config['num_train_timesteps'], (batch_size,), device=device,
-                                              dtype=torch.long)
+            sampled_timesteps = torch.randint(0, scheduler.config['num_train_timesteps'], (batch_size,), device=device)
 
             # Forward diffuse
             noises = torch.randn_like(batch_ys)
-            diffused_ys = scheduler.add_noise(original_samples=batch_ys, noise=noises, timesteps=sampled_timesteps)
+            diffused_ys = scheduler.add_noise(original_samples=batch_ys, noise=noises,
+                                              timesteps=torch.IntTensor(sampled_timesteps))
 
             # Predict noise
             pred_noise = model.forward(diffused_ys, batch_xs, sampled_timesteps)
@@ -162,7 +161,7 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler, xs: torch.T
     return ys
 
 
-def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, device: str):
+def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: SimpleRegressionDataset, device: str):
     example_num = 20
     data_loader = DataLoader(dataset, batch_size=len(dataset))
 
@@ -186,11 +185,11 @@ def main():
     print(f"Device: {device}")
 
     scheduler = build_scheduler()
-    train_dataset = SimpleRegressionDataset(sample_total_num=10000)
-    model = NoisePredictor(x_dim=X_DIM, hidden=256, timestep_emb_dim=64).to(device)
     model_save_path = ROOT_PATH + "/Checkpoint/SimpleRegression/Diffusers"
 
     # Train
+    train_dataset = SimpleRegressionDataset(sample_total_num=10000)
+    model = NoisePredictor(x_dim=X_DIM, hidden_dim=256, timestep_emb_dim=64).to(device)
     model = train(model, scheduler, train_dataset, device)
     model.save_pretrained(model_save_path)
 
