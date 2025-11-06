@@ -10,11 +10,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-
 from diffusers import DDPMScheduler
-from diffusers.configuration_utils import ConfigMixin
+from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
+from torch.utils.data import Dataset, DataLoader
 
 from util.model_helper import SinusoidalPosEmb, ResBlock, evaluate
 
@@ -53,12 +52,14 @@ class SimpleRegressionDataset(Dataset):
         return self.x[idx], self.y[idx]
 
 
+# ModelMixin: A base class for models in diffusers that provides utility functions.
+# ConfigMixin: A base class for models in diffusers that provides configuration management.
 class NoisePredictor(ModelMixin, ConfigMixin):
 
+    # register_to_config: Register the arguments  to the model's configuration.
+    @register_to_config
     def __init__(self, x_dim: int, hidden: int = 256, timestep_emb_dim: int = 64):
         super().__init__()
-        # TODO
-        self.save_hyperparameters = getattr(self, "save_hyperparameters", lambda *args, **kwargs: None)
         self.x_dim = x_dim
         self.hidden = hidden
         self.timestep_emb_dim = timestep_emb_dim
@@ -95,7 +96,7 @@ def build_scheduler():
         prediction_type="epsilon",  # predict noise
         clip_sample=False,
     )
-    # diffusers schedulers are device-agnostic; tensors we pass will be on the right device
+
     return scheduler
 
 
@@ -187,11 +188,15 @@ def main():
     train_dataset = SimpleRegressionDataset(sample_total_num=10000)
     model = NoisePredictor(x_dim=X_DIM, hidden=256, timestep_emb_dim=64).to(device)
 
+    # Train
     model = train(model, scheduler, train_dataset, device)
-
+    model.save_pretrained("Diffusers")
+    # Predict
+    model = NoisePredictor.from_pretrained("Diffusers").to(device)
     test_dataset = SimpleRegressionDataset(sample_total_num=20, seed=626)
     true_ys, pred_ys = predict(model, scheduler, test_dataset, device)
 
+    # Evaluate
     evaluate(true_ys, pred_ys)
 
 
