@@ -15,7 +15,8 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from util.model_helper import SinusoidalPosEmb, ResBlock, evaluate
+from constant import ROOT_PATH
+from util.ModelHelper import SinusoidalPosEmb, ResBlock, evaluate
 
 # Dataset setting
 X_DIM = 5
@@ -187,12 +188,14 @@ def main():
     scheduler = build_scheduler()
     train_dataset = SimpleRegressionDataset(sample_total_num=10000)
     model = NoisePredictor(x_dim=X_DIM, hidden=256, timestep_emb_dim=64).to(device)
+    model_save_path = ROOT_PATH + "/Checkpoint/SimpleRegression/Diffusers"
 
     # Train
     model = train(model, scheduler, train_dataset, device)
-    model.save_pretrained("Diffusers")
+    model.save_pretrained(model_save_path)
+
     # Predict
-    model = NoisePredictor.from_pretrained("Diffusers").to(device)
+    model = NoisePredictor.from_pretrained(model_save_path).to(device)
     test_dataset = SimpleRegressionDataset(sample_total_num=20, seed=626)
     true_ys, pred_ys = predict(model, scheduler, test_dataset, device)
 

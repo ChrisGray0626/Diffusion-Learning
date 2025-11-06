@@ -12,7 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-from util.model_helper import SinusoidalPosEmb, ResBlock, evaluate
+from util.ModelHelper import SinusoidalPosEmb, ResBlock, evaluate
 
 # Dataset setting
 X_DIM = 5
