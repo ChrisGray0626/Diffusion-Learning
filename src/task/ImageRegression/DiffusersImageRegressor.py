@@ -22,8 +22,6 @@ INPUT_CHANNEL_NUM = 5
 OUTPUT_CHANNEL_NUM = 1
 IMAGE_HEIGHT = 64
 IMAGE_WIDTH = 64
-# Mask probability for missing data
-MASK_PROB = 0.10
 
 # Diffusion setting
 STEP_TOTAL_NUM = 200
@@ -31,14 +29,14 @@ BETA_START = 1e-4
 BETA_END = 0.02
 
 # Train setting
-TOTAL_EPOCH = 20
+TOTAL_EPOCH = 10
 BATCH_SIZE = 32
 lr = 2e-4
 
 
 class ImageRegressionDataset(Dataset):
     def __init__(self, sample_total_num, seed=42,
-                 missing_prob: float = MASK_PROB):
+                 missing_prob: float = 0.1):
         rng = np.random.RandomState(seed)
         self.xs = rng.uniform(-1, 1, size=(sample_total_num, IMAGE_HEIGHT, IMAGE_WIDTH, INPUT_CHANNEL_NUM)).astype(
             np.float32)  # [B, H, W, IC]
@@ -200,21 +198,20 @@ def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageRegress
 @torch.no_grad()
 def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler, xs: torch.Tensor, device: str) -> torch.Tensor:
     model.eval()
-    batch_size = xs.shape[0]
-    ys = torch.randn(batch_size, OUTPUT_CHANNEL_NUM, IMAGE_HEIGHT, IMAGE_WIDTH, device=device)
+    B, _, H, W = xs.shape
+    ys = torch.randn(B, OUTPUT_CHANNEL_NUM, H, W, device=device)
 
-    # Create standard decreasing timesteps for sampling
-    timesteps = scheduler.timesteps
-    # For sampling we need to set the scheduler to inference mode
-    scheduler.set_timesteps(len(timesteps))
+    # Create inference timesteps
+    timestep_total_num = scheduler.config['num_train_timesteps']
+    # Set the scheduler to inference mode
+    scheduler.set_timesteps(timestep_total_num)
 
-    # When using set_timesteps, scheduler.timesteps is a long tensor like [T-1, ..., 0]
-    for t in scheduler.timesteps:
-        t_batch = torch.full((batch_size,), t.item(), device=device, dtype=torch.long)
+    for timestep in scheduler.timesteps:
+        timesteps = torch.full((B,), timestep.item(), device=device, dtype=torch.long)
         # Predict noise
-        pred_noises = model.forward(ys, xs, t_batch)
+        pred_noises = model.forward(ys, xs, timesteps)
         # One reverse step
-        step_out = scheduler.step(model_output=pred_noises, timestep=t, sample=ys)
+        step_out = scheduler.step(model_output=pred_noises, timestep=timestep, sample=ys)
         ys = step_out.prev_sample
 
     return ys
@@ -224,10 +221,9 @@ def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageRegre
     example_num = 5
     data_loader = DataLoader(dataset, batch_size=len(dataset))
 
-    xs, true_ys, masks = next(iter(data_loader))
+    xs, true_ys, _ = next(iter(data_loader))
     xs = xs.to(device)
     true_ys = true_ys.to(device)
-    masks = masks.to(device)
     with torch.no_grad():
         pred_ys = reverse_diffuse(model, scheduler, xs, device=device)
 
@@ -235,7 +231,7 @@ def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageRegre
         print(f"  True Y range: [{true_ys[i].min().item():.4f}, {true_ys[i].max().item():.4f}]")
         print(f"  Pred Y range: [{pred_ys[i].min().item():.4f}, {pred_ys[i].max().item():.4f}]")
 
-    return true_ys, pred_ys, masks
+    return true_ys, pred_ys
 
 
 def main():
@@ -258,15 +254,11 @@ def main():
     # Predict
     model = NoisePredictor.from_pretrained(model_save_path).to(device)
     test_dataset = ImageRegressionDataset(sample_total_num=20, missing_prob=0.0, seed=626)
-    true_ys, pred_ys, masks = predict(model, scheduler, test_dataset, device)
+    true_ys, pred_ys = predict(model, scheduler, test_dataset, device)
 
     # Evaluate
     true_ys = true_ys.view(true_ys.shape[0], -1)
     pred_ys = pred_ys.view(pred_ys.shape[0], -1)
-    masks = masks.view(masks.shape[0], -1)
-    # Mask Y
-    true_ys = true_ys[masks.bool()]
-    pred_ys = pred_ys[masks.bool()]
 
     evaluate(true_ys, pred_ys)
 
