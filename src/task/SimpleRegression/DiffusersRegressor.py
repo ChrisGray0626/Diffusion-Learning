@@ -119,7 +119,7 @@ def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: SimpleRegres
             # Forward diffuse
             noises = torch.randn_like(batch_ys)
             diffused_ys = scheduler.add_noise(original_samples=batch_ys, noise=noises,
-                                              timesteps=torch.IntTensor(sampled_timesteps))
+                                              timesteps=sampled_timesteps)
 
             # Predict noise
             pred_noise = model.forward(diffused_ys, batch_xs, sampled_timesteps)

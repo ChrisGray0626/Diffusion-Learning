@@ -9,20 +9,21 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers import DDPMScheduler
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from constant import ROOT_PATH
-from util.ModelHelper import SinusoidalPosEmb, evaluate
+from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_masked_mse
 
 # Dataset setting
 INPUT_CHANNEL_NUM = 5
 OUTPUT_CHANNEL_NUM = 1
 IMAGE_HEIGHT = 64
 IMAGE_WIDTH = 64
+# Mask probability for missing data
+MASK_PROB = 0.10
 
 # Diffusion setting
 STEP_TOTAL_NUM = 200
@@ -30,13 +31,14 @@ BETA_START = 1e-4
 BETA_END = 0.02
 
 # Train setting
-TOTAL_EPOCH = 10
+TOTAL_EPOCH = 20
 BATCH_SIZE = 32
 lr = 2e-4
 
 
 class ImageRegressionDataset(Dataset):
-    def __init__(self, sample_total_num, seed=42):
+    def __init__(self, sample_total_num, seed=42,
+                 missing_prob: float = MASK_PROB):
         rng = np.random.RandomState(seed)
         self.xs = rng.uniform(-1, 1, size=(sample_total_num, IMAGE_HEIGHT, IMAGE_WIDTH, INPUT_CHANNEL_NUM)).astype(
             np.float32)  # [B, H, W, IC]
@@ -50,14 +52,29 @@ class ImageRegressionDataset(Dataset):
         ).astype(np.float32)  # [B, H, W, OC]
         self.ys = ys.reshape(sample_total_num, IMAGE_HEIGHT, IMAGE_WIDTH, OUTPUT_CHANNEL_NUM)
 
+        # Generate mask
+        if missing_prob > 0:
+            # Bernoulli sampling
+            masks = rng.binomial(1, 1.0 - missing_prob,
+                                 size=(sample_total_num, IMAGE_HEIGHT, IMAGE_WIDTH, 1))
+        else:
+            masks = np.ones((sample_total_num, IMAGE_HEIGHT, IMAGE_WIDTH, 1))
+        self.masks = masks.astype(np.float32)  # [B, H, W, 1]
+
+        # Mask X
+        self.xs = self.xs * self.masks  # [B, H, W, IC]
+        # Mask Y
+        self.ys = self.ys * self.masks  # [B, H, W, OC]
+
     def __len__(self):
         return len(self.xs)
 
     def __getitem__(self, idx):
         xs = torch.from_numpy(self.xs[idx]).permute(2, 0, 1)  # [H, W, IC] -> [IC, H, W]
         ys = torch.from_numpy(self.ys[idx]).permute(2, 0, 1)  # [H, W, OC] -> [OC, H, W]
+        masks = torch.from_numpy(self.masks[idx]).permute(2, 0, 1)  # [H, W, OC] -> [OC, H, W]
 
-        return xs, ys
+        return xs, ys, masks
 
 
 class NoisePredictor(ModelMixin, ConfigMixin):
@@ -148,9 +165,10 @@ def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageRegress
     for epoch in range(TOTAL_EPOCH):
         total_loss = 0.0
         total_samples = 0
-        for batch_xs, batch_ys in data_loader:
+        for batch_xs, batch_ys, batch_masks in data_loader:
             batch_xs = batch_xs.to(device)
             batch_ys = batch_ys.to(device)
+            batch_masks = batch_masks.to(device)
             batch_size = batch_xs.shape[0]
 
             # Sample random timesteps uniformly
@@ -159,11 +177,12 @@ def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageRegress
             # Forward diffuse
             noises = torch.randn_like(batch_ys)
             diffused_ys = scheduler.add_noise(original_samples=batch_ys, noise=noises,
-                                              timesteps=torch.IntTensor(sampled_timesteps))
+                                              timesteps=sampled_timesteps)
 
             # Predict noise
             pred_noise = model.forward(diffused_ys, batch_xs, sampled_timesteps)
-            loss = F.mse_loss(pred_noise, noises)
+            # Calculate masked MSE
+            loss = calc_masked_mse(pred_noise, noises, batch_masks)
 
             opt.zero_grad()
             loss.backward()
@@ -205,19 +224,18 @@ def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageRegre
     example_num = 5
     data_loader = DataLoader(dataset, batch_size=len(dataset))
 
-    xs, true_ys = next(iter(data_loader))
+    xs, true_ys, masks = next(iter(data_loader))
     xs = xs.to(device)
     true_ys = true_ys.to(device)
+    masks = masks.to(device)
     with torch.no_grad():
         pred_ys = reverse_diffuse(model, scheduler, xs, device=device)
 
     for i in range(min(example_num, xs.shape[0])):
-        sample_mse = F.mse_loss(pred_ys[i:i + 1], true_ys[i:i + 1]).item()
-        print(f"Sample {i + 1}: MSE = {sample_mse:.6f}")
         print(f"  True Y range: [{true_ys[i].min().item():.4f}, {true_ys[i].max().item():.4f}]")
         print(f"  Pred Y range: [{pred_ys[i].min().item():.4f}, {pred_ys[i].max().item():.4f}]")
 
-    return true_ys, pred_ys
+    return true_ys, pred_ys, masks
 
 
 def main():
@@ -239,12 +257,17 @@ def main():
 
     # Predict
     model = NoisePredictor.from_pretrained(model_save_path).to(device)
-    test_dataset = ImageRegressionDataset(sample_total_num=20, seed=626)
-    true_ys, pred_ys = predict(model, scheduler, test_dataset, device)
+    test_dataset = ImageRegressionDataset(sample_total_num=20, missing_prob=0.0, seed=626)
+    true_ys, pred_ys, masks = predict(model, scheduler, test_dataset, device)
 
-    # Evaluate - 将2D图像展平进行评估
-    true_ys = true_ys.view(true_ys.shape[0], -1)  # [B, H, W] -> [B, H * W]
-    pred_ys = pred_ys.view(pred_ys.shape[0], -1)  # [B, H, W] -> [B, H * W]
+    # Evaluate
+    true_ys = true_ys.view(true_ys.shape[0], -1)
+    pred_ys = pred_ys.view(pred_ys.shape[0], -1)
+    masks = masks.view(masks.shape[0], -1)
+    # Mask Y
+    true_ys = true_ys[masks.bool()]
+    pred_ys = pred_ys[masks.bool()]
+
     evaluate(true_ys, pred_ys)
 
 

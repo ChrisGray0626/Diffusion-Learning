@@ -21,6 +21,7 @@ class SinusoidalPosEmb(nn.Module):
     seq: [batch_size, ]
     embed_seq: [batch_size, dim]
     """
+
     def forward(self, seq):
         device = seq.device
         half = self.dim // 2
@@ -57,3 +58,20 @@ def evaluate(true_ys: torch.Tensor, pred_ys: torch.Tensor):
     print(f"Evaluation MSE: {mse.item():.6f}")
     print(f"Evaluation RMSE: {rmse.item():.6f}")
     print(f"Evaluation R2: {r2.item():.6f}")
+
+
+def calc_masked_mse(preds: torch.Tensor, targets: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    """
+    Calculate the masked mean squared error between predictions and targets.
+    Args:
+        preds (torch.Tensor): [B, C, H, W]
+        targets (torch.Tensor): [B, C, H, W]
+        masks (torch.Tensor): [B, 1, H, W]
+        C is the number of channels
+    Returns:
+        mse (torch.Tensor): scalar tensor representing the masked MSE
+    """
+    mse = (preds - targets) ** 2 * masks
+    mse = (mse.sum(dim=(1, 2, 3)) / torch.clamp(masks.sum(dim=(1, 2, 3)), min=1.0)).mean()
+
+    return mse
