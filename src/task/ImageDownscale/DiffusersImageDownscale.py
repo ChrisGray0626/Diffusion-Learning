@@ -112,23 +112,22 @@ class NoisePredictor(ModelMixin, ConfigMixin):
                  lat_min: float = -90.0, lat_max: float = 90.0,
                  lon_min: float = -180.0, lon_max: float = 180.0):
         super().__init__()
-        self.input_channels = input_channel_num
+        self.input_channel_num = input_channel_num
         self.hidden_dim = hidden_dim
 
         # Input layer
         self.input_layer = nn.Conv2d(output_channel_num + input_channel_num, hidden_dim, kernel_size=3, padding=1)
 
         # Timestep embedding
-        self.timestep_embedder = SinusoidalPosEmb(timestep_emb_dim)
         self.timestep_embedding = nn.Sequential(
             SinusoidalPosEmb(timestep_emb_dim),
             nn.Linear(timestep_emb_dim, timestep_emb_dim * 4),
             nn.SiLU(),
             nn.Linear(timestep_emb_dim * 4, timestep_emb_dim * 4),
         )
-        self.timestep_emb2hidden = nn.Conv2d(timestep_emb_dim * 4, hidden_dim, kernel_size=1)
+        self.emb_timestep2hidden = nn.Conv2d(timestep_emb_dim * 4, hidden_dim, kernel_size=1)
 
-        # Position embedding: from coordinates to hidden dimension
+        # Position embedding
         self.pos_embedding = nn.Sequential(
             PosEmbedding(
                 embed_dim=pos_embed_dim,
@@ -170,7 +169,7 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         B, _, H, W = diffused_ys.shape
         embed_timesteps = embed_timesteps.expand(B, -1, H, W)
         # Convolve timestep embeddings to [B, hidden_dim, H, W]
-        embed_timesteps = self.timestep_emb2hidden(embed_timesteps)
+        embed_timesteps = self.emb_timestep2hidden(embed_timesteps)
 
         # Embed spatial position
         embed_pos = self.pos_embedding(pos)  # [B, 2, H, W] -> [B, hidden_dim, H, W]
