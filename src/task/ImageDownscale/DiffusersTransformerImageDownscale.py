@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  @Description Diffusers-based Image Downscale Task (DDPM) - 2D Image Input/Output
+  @Description Diffusers-Transformer Image Downscaling Task
   @Author Chris
   @Date 2025/11/05
 """
