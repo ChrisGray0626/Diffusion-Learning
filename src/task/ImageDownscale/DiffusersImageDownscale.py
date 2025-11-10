@@ -9,14 +9,13 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from diffusers import DDPMScheduler
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from constant import ROOT_PATH
-from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_masked_mse, PosEmbedding, ResBlock
+from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_masked_mse, PosEmbedding, BaseResBlock
 
 # Dataset setting
 INPUT_CHANNEL_NUM = 5
@@ -30,7 +29,7 @@ BETA_END = 0.02
 # Train setting
 TOTAL_EPOCH = 20
 BATCH_SIZE = 32
-lr = 2e-4
+LR = 2e-4
 
 
 class ImageDownscaleDataset(Dataset):
@@ -91,6 +90,20 @@ class ImageDownscaleDataset(Dataset):
         return xs, ys, pos, masks
 
 
+class ResBlock(BaseResBlock):
+
+    def __init__(self, dim):
+        super().__init__(dim)
+        self.net = nn.Sequential(
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
+            nn.GroupNorm(8, dim),
+            nn.SiLU(),
+            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
+            nn.GroupNorm(8, dim),
+            nn.SiLU(),
+        )
+
+
 class NoisePredictor(ModelMixin, ConfigMixin):
 
     @register_to_config
@@ -99,6 +112,9 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         super().__init__()
         self.input_channels = input_channel_num
         self.hidden_dim = hidden_dim
+
+        # Input layer
+        self.input_layer = nn.Conv2d(output_channel_num + input_channel_num, hidden_dim, kernel_size=3, padding=1)
 
         # Timestep embedding
         self.timestep_embedder = SinusoidalPosEmb(timestep_emb_dim)
@@ -113,21 +129,21 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         self.pos_embedding = PosEmbedding(embed_dim=pos_embed_dim)
         self.pos_emb2hidden = nn.Conv2d(pos_embed_dim, hidden_dim, kernel_size=1)
 
-        # Input convolutional layer
-        self.input_conv = nn.Conv2d(output_channel_num + input_channel_num, hidden_dim, kernel_size=3, padding=1)
-
-        # First residual block
-        self.res_block1 = nn.Sequential(
+        # Residual block
+        self.res_block = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.GroupNorm(8, hidden_dim),
             nn.SiLU(),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.GroupNorm(8, hidden_dim),
         )
-        self.res_block = ResBlock(hidden_dim)
+        self.net = nn.Sequential(
+            ResBlock(hidden_dim),
+            nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1)
+        )
 
         # Output layer
-        self.output_conv = nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1)
+        # self.output_layer = nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1)
 
     def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
                 pos: torch.Tensor) -> torch.Tensor:
@@ -136,7 +152,7 @@ class NoisePredictor(ModelMixin, ConfigMixin):
             diffused_ys: [B, output_channel_num, H, W]
             xs: [B, input_channel_num, H, W]
             timesteps: [B]
-            pos: [B, 2, H, W] - position coordinates (latitude, longitude) from dataset
+            pos: [B, 2, H, W]
         Returns:
             [B, 1, H, W]
         """
@@ -144,7 +160,7 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         # Concatenate diffused_ys and xs as inputs
         inputs = torch.cat([diffused_ys, xs], dim=1)  # [B, input_channel_num + output_channel_num, H, W]
         # Convolve inputs to [B, hidden_channels, H, W]
-        inputs = self.input_conv(inputs)
+        inputs = self.input_layer(inputs)
 
         # Embed timestep
         embed_timesteps = self.timestep_embedder(timesteps)  # [B, timestep_emb_dim]
@@ -165,15 +181,15 @@ class NoisePredictor(ModelMixin, ConfigMixin):
 
         # Add timestep embeddings & position embeddings
         inputs = inputs + embed_timesteps + embed_pos
-
-        # First residual block
-        residual = inputs
-        out = self.res_block1(inputs)
-        out = out + residual  # Residual connection
-        out = F.silu(out)  # Apply activation after residual
+        out = self.net(inputs)
+        # Residual connection
+        # residual = inputs
         # out = self.res_block(inputs)
-        # Output layer
-        out = self.output_conv(out)
+        # out = out + residual
+        #
+        # out = functional.silu(out)  # Apply activation after residual
+        # # Output layer
+        # out = self.output_layer(out)
 
         return out
 
@@ -193,7 +209,7 @@ def build_scheduler():
 
 def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageDownscaleDataset, device: str):
     data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
 
     # Learning rate scheduler
     lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -315,7 +331,7 @@ def main():
 
     model = NoisePredictor(
         input_channel_num=INPUT_CHANNEL_NUM,
-        hidden_dim=64,
+        hidden_dim=256,
         timestep_emb_dim=64,
         pos_embed_dim=32
     ).to(device)

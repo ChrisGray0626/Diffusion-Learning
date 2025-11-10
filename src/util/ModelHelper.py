@@ -8,7 +8,7 @@
 import math
 
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as functional
 from torch import nn
 
 
@@ -30,23 +30,14 @@ class SinusoidalPosEmb(nn.Module):
         embed_seq = seq[:, None].float() * embed_seq[None, :]
         embed_seq = torch.cat([torch.sin(embed_seq), torch.cos(embed_seq)], dim=-1)
         if self.dim % 2 == 1:  # pad if odd
-            embed_seq = F.pad(embed_seq, (0, 1))
+            embed_seq = functional.pad(embed_seq, (0, 1))
 
         return embed_seq
 
 
 class PosEmbedding(nn.Module):
-    """
-    Sinusoidal position embedding for geographic coordinates (latitude, longitude).
-    Uses the existing SinusoidalPosEmb from ModelHelper for embedding.
-    Applies sinusoidal embedding to each coordinate separately, then concatenates.
-    """
 
     def __init__(self, embed_dim: int):
-        """
-        Args:
-            embed_dim: Dimension of position embeddings (total for both coordinates)
-        """
         super().__init__()
         self.embed_dim = embed_dim
         # Each coordinate (lat, lon) gets embed_dim // 2 dimensions
@@ -55,18 +46,18 @@ class PosEmbedding(nn.Module):
         self.lat_embedder = SinusoidalPosEmb(self.dim_per_coord)
         self.lon_embedder = SinusoidalPosEmb(self.dim_per_coord)
 
-    def forward(self, pos_coords: torch.Tensor) -> torch.Tensor:
+    def forward(self, pos: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pos_coords: [B, 2, H, W] - position coordinates (latitude, longitude)
+            pos: [B, 2, H, W]
         Returns:
-            [B, embed_dim, H, W] - embedded position coordinates
+            [B, embed_dim, H, W]
         """
-        B, _, H, W = pos_coords.shape
+        B, _, H, W = pos.shape
 
         # Extract lat and lon
-        lat = pos_coords[:, 0, :, :]  # [B, H, W]
-        lon = pos_coords[:, 1, :, :]  # [B, H, W]
+        lat = pos[:, 0, :, :]  # [B, H, W]
+        lon = pos[:, 1, :, :]  # [B, H, W]
 
         # Normalize coordinates to reasonable range for embedding
         # Latitude: [-90, 90] -> scale to [0, 180] for embedding
@@ -96,7 +87,20 @@ class PosEmbedding(nn.Module):
         return pos_embed
 
 
-class ResBlock(nn.Module):
+class BaseResBlock(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.net = None
+
+    def forward(self, x):
+        return x + self.net(x)
+
+
+class SimpleResBlock(nn.Module):
+    """
+    Simple Residual Block For 1D inputs
+    """
+
     def __init__(self, dim):
         super().__init__()
         self.net = nn.Sequential(
@@ -113,7 +117,7 @@ class ResBlock(nn.Module):
 
 
 def evaluate(true_ys: torch.Tensor, pred_ys: torch.Tensor):
-    mse = F.mse_loss(pred_ys, true_ys)
+    mse = functional.mse_loss(pred_ys, true_ys)
     rmse = torch.sqrt(mse)
     r2 = 1 - torch.sum((true_ys - pred_ys) ** 2) / torch.sum((true_ys - torch.mean(true_ys)) ** 2)
     print(f"Evaluation MSE: {mse.item():.6f}")

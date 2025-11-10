@@ -9,10 +9,10 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as functional
 from torch.utils.data import Dataset, DataLoader
 
-from util.ModelHelper import SinusoidalPosEmb, ResBlock, evaluate
+from util.ModelHelper import SinusoidalPosEmb, SimpleResBlock, evaluate
 
 # Dataset setting
 X_DIM = 5
@@ -83,7 +83,7 @@ class NoisePredictor(nn.Module):
         in_dim = 1 + x_dim + timestep_emb_dim  # y is scalar -> 1
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
-            ResBlock(hidden),
+            SimpleResBlock(hidden),
             nn.Linear(hidden, 1)  # predict noise scalar
         )
 
@@ -162,7 +162,7 @@ def train(model, params: DiffusionParams, dataset, device):
             batch_diffused_ys, noises = forward_diffuse(params, batch_ys, sampled_timesteps, device)
             # Predict Noise
             pred_noises = model.forward(batch_diffused_ys, batch_xs, sampled_timesteps)
-            loss = F.mse_loss(pred_noises, noises)
+            loss = functional.mse_loss(pred_noises, noises)
             opt.zero_grad()
             loss.backward()
             opt.step()

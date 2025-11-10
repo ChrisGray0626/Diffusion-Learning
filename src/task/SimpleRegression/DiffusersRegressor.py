@@ -9,14 +9,14 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as functional
 from diffusers import DDPMScheduler
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from constant import ROOT_PATH
-from util.ModelHelper import SinusoidalPosEmb, ResBlock, evaluate
+from util.ModelHelper import SinusoidalPosEmb, SimpleResBlock, evaluate
 
 # Dataset setting
 X_DIM = 5
@@ -75,7 +75,7 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         in_dim = 1 + x_dim + timestep_emb_dim
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden_dim),
-            ResBlock(hidden_dim),
+            SimpleResBlock(hidden_dim),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -123,7 +123,7 @@ def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: SimpleRegres
 
             # Predict noise
             pred_noise = model.forward(diffused_ys, batch_xs, sampled_timesteps)
-            loss = F.mse_loss(pred_noise, noises)
+            loss = functional.mse_loss(pred_noise, noises)
 
             opt.zero_grad()
             loss.backward()
