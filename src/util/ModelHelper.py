@@ -37,14 +37,30 @@ class SinusoidalPosEmb(nn.Module):
 
 class PosEmbedding(nn.Module):
 
-    def __init__(self, embed_dim: int):
+    def __init__(self, embed_dim: int,
+                 lat_min: float = -90.0, lat_max: float = 90.0,
+                 lon_min: float = -180.0, lon_max: float = 180.0):
         super().__init__()
+        # Ensure embed_dim is even and >= 4 to avoid padding/truncate
+        assert embed_dim >= 4, f"embed_dim must be >= 4, got {embed_dim}"
+        assert embed_dim % 2 == 0, f"embed_dim must be even, got {embed_dim}"
+
         self.embed_dim = embed_dim
-        # Each coordinate (lat, lon) gets embed_dim // 2 dimensions
-        self.dim_per_coord = embed_dim // 2
-        # Use existing SinusoidalPosEmb for embedding
-        self.lat_embedder = SinusoidalPosEmb(self.dim_per_coord)
-        self.lon_embedder = SinusoidalPosEmb(self.dim_per_coord)
+        # Each coordinate gets half of the total embedding dimension
+        self.coord_embed_dim = embed_dim // 2
+
+        self.lat_min = lat_min
+        self.lat_max = lat_max
+        self.lon_min = lon_min
+        self.lon_max = lon_max
+        self.lat_range = lat_max - lat_min
+        self.lon_range = lon_max - lon_min
+
+        # Pre-compute frequencies for sinusoidal embedding
+        freq_num = max(1, self.coord_embed_dim // 2)
+        freq_base = math.log(10000.0) / max(1, freq_num - 1)
+        # Register freq as buffer so it moves with the model to the correct device
+        self.register_buffer('freq', torch.exp(torch.arange(freq_num, dtype=torch.float32) * -freq_base))
 
     def forward(self, pos: torch.Tensor) -> torch.Tensor:
         """
@@ -53,38 +69,31 @@ class PosEmbedding(nn.Module):
         Returns:
             [B, embed_dim, H, W]
         """
+
         B, _, H, W = pos.shape
 
-        # Extract lat and lon
-        lat = pos[:, 0, :, :]  # [B, H, W]
-        lon = pos[:, 1, :, :]  # [B, H, W]
+        # Handle lat and lon
+        lats = pos[:, 0, :, :]  # [B, H, W]
+        lons = pos[:, 1, :, :]  # [B, H, W]
+        # Normalize to [0, 1] based on actual boundaries
+        lats = (lats - self.lat_min) / self.lat_range
+        lons = (lons - self.lon_min) / self.lon_range
+        # Scale to appropriate range for embedding for better frequency coverage
+        lats = lats * 100.0  # [B, H, W]
+        lons = lons * 100.0  # [B, H, W]
 
-        # Normalize coordinates to reasonable range for embedding
-        # Latitude: [-90, 90] -> scale to [0, 180] for embedding
-        lat_scaled = (lat + 90.0)  # [B, H, W], range [0, 180]
-        # Longitude: [-180, 180] -> scale to [0, 360] for embedding
-        lon_scaled = (lon + 180.0)  # [B, H, W], range [0, 360]
-
-        # Flatten spatial dimensions for embedding
-        # SinusoidalPosEmb expects [batch_size] input
-        lat_flat = lat_scaled.view(-1)  # [B*H*W]
-        lon_flat = lon_scaled.view(-1)  # [B*H*W]
-
-        # Apply sinusoidal embedding using existing SinusoidalPosEmb
-        lat_embed_flat = self.lat_embedder(lat_flat)  # [B*H*W, dim_per_coord]
-        lon_embed_flat = self.lon_embedder(lon_flat)  # [B*H*W, dim_per_coord]
-
-        # Reshape back to spatial dimensions
-        lat_embed = lat_embed_flat.view(B, H, W, self.dim_per_coord)  # [B, H, W, dim_per_coord]
-        lon_embed = lon_embed_flat.view(B, H, W, self.dim_per_coord)  # [B, H, W, dim_per_coord]
+        # Calculate embeddings using sinusoidal frequencies
+        # Multiply coordinates with frequencies: [B, H, W] * [freq_num] -> [B, H, W, freq_num]
+        embed_lats = lats[..., None] * self.freq[None, None, None, :]  # [B, H, W, freq_num]
+        embed_lats = torch.cat([torch.sin(embed_lats), torch.cos(embed_lats)], dim=-1)  # [B, H, W, coord_embed_dim]
+        emb_lons = lons[..., None] * self.freq[None, None, None, :]  # [B, H, W, freq_num]
+        emb_lons = torch.cat([torch.sin(emb_lons), torch.cos(emb_lons)], dim=-1)  # [B, H, W, coord_embed_dim]
 
         # Concatenate along channel dimension
-        pos_embed = torch.cat([lat_embed, lon_embed], dim=-1)  # [B, H, W, embed_dim]
+        embed_pos = torch.cat([embed_lats, emb_lons], dim=-1)  # [B, H, W, embed_dim]
+        embed_pos = embed_pos.permute(0, 3, 1, 2)  # [B, H, W, embed_dim] -> [B, embed_dim, H, W]
 
-        # Permute to [B, embed_dim, H, W]
-        pos_embed = pos_embed.permute(0, 3, 1, 2)
-
-        return pos_embed
+        return embed_pos
 
 
 class BaseResBlock(nn.Module):

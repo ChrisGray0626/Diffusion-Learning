@@ -84,8 +84,8 @@ class ImageDownscaleDataset(Dataset):
     def __getitem__(self, idx):
         xs = torch.from_numpy(self.xs[idx]).permute(2, 0, 1)  # [H, W, IC] -> [IC, H, W]
         ys = torch.from_numpy(self.ys[idx]).permute(2, 0, 1)  # [H, W, OC] -> [OC, H, W]
-        masks = torch.from_numpy(self.masks[idx]).permute(2, 0, 1)  # [H, W, 1] -> [1, H, W]
         pos = torch.from_numpy(self.pos).permute(2, 0, 1)  # [H, W, 2] -> [2, H, W]
+        masks = torch.from_numpy(self.masks[idx]).permute(2, 0, 1)  # [H, W, 1] -> [1, H, W]
 
         return xs, ys, pos, masks
 
@@ -108,7 +108,9 @@ class NoisePredictor(ModelMixin, ConfigMixin):
 
     @register_to_config
     def __init__(self, input_channel_num, output_channel_num: int = 1, hidden_dim: int = 128,
-                 timestep_emb_dim: int = 128, pos_embed_dim: int = 64):
+                 timestep_emb_dim: int = 128, pos_embed_dim: int = 64,
+                 lat_min: float = -90.0, lat_max: float = 90.0,
+                 lon_min: float = -180.0, lon_max: float = 180.0):
         super().__init__()
         self.input_channels = input_channel_num
         self.hidden_dim = hidden_dim
@@ -118,32 +120,30 @@ class NoisePredictor(ModelMixin, ConfigMixin):
 
         # Timestep embedding
         self.timestep_embedder = SinusoidalPosEmb(timestep_emb_dim)
-        self.timestep_proj = nn.Sequential(
+        self.timestep_embedding = nn.Sequential(
+            SinusoidalPosEmb(timestep_emb_dim),
             nn.Linear(timestep_emb_dim, timestep_emb_dim * 4),
             nn.SiLU(),
             nn.Linear(timestep_emb_dim * 4, timestep_emb_dim * 4),
         )
         self.timestep_emb2hidden = nn.Conv2d(timestep_emb_dim * 4, hidden_dim, kernel_size=1)
 
-        # Position embedding
-        self.pos_embedding = PosEmbedding(embed_dim=pos_embed_dim)
-        self.pos_emb2hidden = nn.Conv2d(pos_embed_dim, hidden_dim, kernel_size=1)
-
-        # Residual block
-        self.res_block = nn.Sequential(
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(8, hidden_dim),
-            nn.SiLU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
-            nn.GroupNorm(8, hidden_dim),
+        # Position embedding: from coordinates to hidden dimension
+        self.pos_embedding = nn.Sequential(
+            PosEmbedding(
+                embed_dim=pos_embed_dim,
+                lat_min=lat_min,
+                lat_max=lat_max,
+                lon_min=lon_min,
+                lon_max=lon_max
+            ),
+            nn.Conv2d(pos_embed_dim, hidden_dim, kernel_size=1)
         )
+
         self.net = nn.Sequential(
             ResBlock(hidden_dim),
             nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1)
         )
-
-        # Output layer
-        # self.output_layer = nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1)
 
     def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
                 pos: torch.Tensor) -> torch.Tensor:
@@ -163,33 +163,22 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         inputs = self.input_layer(inputs)
 
         # Embed timestep
-        embed_timesteps = self.timestep_embedder(timesteps)  # [B, timestep_emb_dim]
-        embed_timesteps = self.timestep_proj(embed_timesteps)  # [B, timestep_emb_dim * 4]
-        # Expand timestep embedding to spatial dimensions
-        B, _, H, W = diffused_ys.shape
+        embed_timesteps = self.timestep_embedding(timesteps)  # [B, timestep_emb_dim * 4]
         # Insert two singleton dimensions for H and W
         embed_timesteps = embed_timesteps[:, :, None, None]
         # Expand to [B, timestep_emb_dim * 4, H, W]
+        B, _, H, W = diffused_ys.shape
         embed_timesteps = embed_timesteps.expand(B, -1, H, W)
         # Convolve timestep embeddings to [B, hidden_dim, H, W]
-        embed_timesteps = self.timestep_emb2hidden(
-            embed_timesteps)  # [B, timestep_emb_dim * 4, H, W] -> [B, hidden_dim, H, W]
+        embed_timesteps = self.timestep_emb2hidden(embed_timesteps)
 
         # Embed spatial position
-        embed_pos = self.pos_embedding(pos)  # [B, pos_embed_dim, H, W]
-        embed_pos = self.pos_emb2hidden(embed_pos)  # [B, hidden_dim, H, W]
+        embed_pos = self.pos_embedding(pos)  # [B, 2, H, W] -> [B, hidden_dim, H, W]
 
         # Add timestep embeddings & position embeddings
         inputs = inputs + embed_timesteps + embed_pos
+
         out = self.net(inputs)
-        # Residual connection
-        # residual = inputs
-        # out = self.res_block(inputs)
-        # out = out + residual
-        #
-        # out = functional.silu(out)  # Apply activation after residual
-        # # Output layer
-        # out = self.output_layer(out)
 
         return out
 
@@ -331,22 +320,24 @@ def main():
 
     model = NoisePredictor(
         input_channel_num=INPUT_CHANNEL_NUM,
-        hidden_dim=256,
+        hidden_dim=128,
         timestep_emb_dim=64,
-        pos_embed_dim=32
+        pos_embed_dim=32,
+        lat_min=lat_min,
+        lat_max=lat_max,
+        lon_min=lon_min,
+        lon_max=lon_max
     ).to(device)
     model = train(model, scheduler, train_dataset, device)
     model.save_pretrained(model_save_path)
 
     # Predict on 256x256
-    # Use the same boundary coordinates as training data
     model = NoisePredictor.from_pretrained(model_save_path).to(device)
     for scale in [128]:
         print("\n" + "=" * 60)
         print(f"Predicting on {scale} * {scale} data...")
         print("=" * 60)
-        print(f"Using same boundary coordinates: lat=[{lat_min}, {lat_max}], lon=[{lon_min}, {lon_max}]")
-        test_dataset_256 = ImageDownscaleDataset(
+        test_dataset = ImageDownscaleDataset(
             sample_total_num=10,
             seed=626,
             image_height=scale,
@@ -356,7 +347,7 @@ def main():
             lon_min=lon_min,
             lon_max=lon_max
         )
-        true_ys, pred_ys = predict(model, scheduler, test_dataset_256, device)
+        true_ys, pred_ys = predict(model, scheduler, test_dataset, device)
 
         # Evaluate
         true_ys = true_ys.view(true_ys.shape[0], -1)
