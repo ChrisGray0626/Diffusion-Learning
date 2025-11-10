@@ -9,13 +9,14 @@
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers import DDPMScheduler
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from constant import ROOT_PATH
-from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_masked_mse
+from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_masked_mse, PosEmbedding, ResBlock
 
 # Dataset setting
 INPUT_CHANNEL_NUM = 5
@@ -27,7 +28,7 @@ BETA_START = 1e-4
 BETA_END = 0.02
 
 # Train setting
-TOTAL_EPOCH = 10
+TOTAL_EPOCH = 20
 BATCH_SIZE = 32
 lr = 2e-4
 
@@ -36,10 +37,17 @@ class ImageDownscaleDataset(Dataset):
     def __init__(self, sample_total_num, seed=42,
                  missing_prob: float = 0.1,
                  image_height: int = 64,
-                 image_width: int = 64):
+                 image_width: int = 64,
+                 lat_min: float = -90.0,
+                 lat_max: float = 90.0,
+                 lon_min: float = -180.0,
+                 lon_max: float = 180.0):
+
         rng = np.random.RandomState(seed)
         self.image_height = image_height
         self.image_width = image_width
+
+        # Build X & Y
         self.xs = rng.uniform(-1, 1, size=(sample_total_num, image_height, image_width, INPUT_CHANNEL_NUM)).astype(
             np.float32)  # [B, H, W, IC]
         ys = (
@@ -52,7 +60,13 @@ class ImageDownscaleDataset(Dataset):
         ).astype(np.float32)  # [B, H, W, OC]
         self.ys = ys.reshape(sample_total_num, image_height, image_width, OUTPUT_CHANNEL_NUM)
 
-        # Generate mask
+        # Build spatial position grid
+        lats = np.linspace(lat_min, lat_max, image_height)  # [H]
+        lons = np.linspace(lon_min, lon_max, image_width)  # [W]
+        lat_grid, lon_grid = np.meshgrid(lats, lons, indexing='ij')  # [H, W]
+        self.pos = np.stack([lat_grid, lon_grid], axis=-1).astype(np.float32)  # [H, W, 2]
+
+        # Build mask
         if missing_prob > 0:
             # Bernoulli sampling
             masks = rng.binomial(1, 1.0 - missing_prob,
@@ -61,9 +75,8 @@ class ImageDownscaleDataset(Dataset):
             masks = np.ones((sample_total_num, image_height, image_width, 1))
         self.masks = masks.astype(np.float32)  # [B, H, W, 1]
 
-        # Mask X
+        # Mask X & Y
         self.xs = self.xs * self.masks  # [B, H, W, IC]
-        # Mask Y
         self.ys = self.ys * self.masks  # [B, H, W, OC]
 
     def __len__(self):
@@ -72,76 +85,97 @@ class ImageDownscaleDataset(Dataset):
     def __getitem__(self, idx):
         xs = torch.from_numpy(self.xs[idx]).permute(2, 0, 1)  # [H, W, IC] -> [IC, H, W]
         ys = torch.from_numpy(self.ys[idx]).permute(2, 0, 1)  # [H, W, OC] -> [OC, H, W]
-        masks = torch.from_numpy(self.masks[idx]).permute(2, 0, 1)  # [H, W, OC] -> [OC, H, W]
+        masks = torch.from_numpy(self.masks[idx]).permute(2, 0, 1)  # [H, W, 1] -> [1, H, W]
+        pos = torch.from_numpy(self.pos).permute(2, 0, 1)  # [H, W, 2] -> [2, H, W]
 
-        return xs, ys, masks
+        return xs, ys, pos, masks
 
 
 class NoisePredictor(ModelMixin, ConfigMixin):
 
     @register_to_config
-    def __init__(self, input_channel_num, output_channel_num: int = 1, hidden_dim: int = 64,
-                 timestep_emb_dim: int = 64):
+    def __init__(self, input_channel_num, output_channel_num: int = 1, hidden_dim: int = 128,
+                 timestep_emb_dim: int = 128, pos_embed_dim: int = 64):
         super().__init__()
         self.input_channels = input_channel_num
         self.hidden_dim = hidden_dim
-        self.timestep_embedder = SinusoidalPosEmb(timestep_emb_dim)
 
-        # Timestep embedding projection
+        # Timestep embedding
+        self.timestep_embedder = SinusoidalPosEmb(timestep_emb_dim)
         self.timestep_proj = nn.Sequential(
             nn.Linear(timestep_emb_dim, timestep_emb_dim * 4),
             nn.SiLU(),
             nn.Linear(timestep_emb_dim * 4, timestep_emb_dim * 4),
         )
+        self.timestep_emb2hidden = nn.Conv2d(timestep_emb_dim * 4, hidden_dim, kernel_size=1)
+
+        # Position embedding
+        self.pos_embedding = PosEmbedding(embed_dim=pos_embed_dim)
+        self.pos_emb2hidden = nn.Conv2d(pos_embed_dim, hidden_dim, kernel_size=1)
+
         # Input convolutional layer
         self.input_conv = nn.Conv2d(output_channel_num + input_channel_num, hidden_dim, kernel_size=3, padding=1)
 
-        # Timestep embedding convolution
-        self.timestep_emb_conv = nn.Conv2d(timestep_emb_dim * 4, hidden_dim, kernel_size=1)
-
-        self.net = nn.Sequential(
+        # First residual block
+        self.res_block1 = nn.Sequential(
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.GroupNorm(8, hidden_dim),
             nn.SiLU(),
             nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
             nn.GroupNorm(8, hidden_dim),
-            nn.SiLU(),
-            nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1)
         )
+        self.res_block = ResBlock(hidden_dim)
 
-    def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        # Output layer
+        self.output_conv = nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1)
+
+    def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
+                pos: torch.Tensor) -> torch.Tensor:
         """
         Args:
             diffused_ys: [B, output_channel_num, H, W]
             xs: [B, input_channel_num, H, W]
             timesteps: [B]
+            pos: [B, 2, H, W] - position coordinates (latitude, longitude) from dataset
         Returns:
             [B, 1, H, W]
         """
-        # Embed timestep
-        embedd_timesteps = self.timestep_embedder(timesteps)  # [B, timestep_emb_dim]
-        embedd_timesteps = self.timestep_proj(embedd_timesteps)  # [B, timestep_emb_dim * 4]
-        # Expand timestep embedding to spatial dimensions
-        B, _, H, W = diffused_ys.shape
-        # Insert two singleton dimensions for H and W
-        embedd_timesteps = embedd_timesteps[
-            :, :, None, None]  # [B, timestep_emb_dim * 4] -> [B, timestep_emb_dim * 4, 1, 1]
-        # Expand to [B, timestep_emb_dim * 4, H, W]
-        embedd_timesteps = embedd_timesteps.expand(B, -1, H,
-                                                   W)  # [B, timestep_emb_dim * 4, 1, 1] -> [B, timestep_emb_dim * 4, H, W]
-        # Convolve timestep embeddings
-        embedd_timesteps = self.timestep_emb_conv(
-            embedd_timesteps)  # [B, timestep_emb_dim * 4, H, W] -> [B, hidden_dim, H, W]
 
         # Concatenate diffused_ys and xs as inputs
         inputs = torch.cat([diffused_ys, xs], dim=1)  # [B, input_channel_num + output_channel_num, H, W]
-        # Convolve inputs
-        inputs = self.input_conv(
-            inputs)  # [B, input_channel_num + output_channel_num, H, W] -> [B, hidden_channels, H, W]
-        # Add timestep embeddings
-        inputs = inputs + embedd_timesteps
+        # Convolve inputs to [B, hidden_channels, H, W]
+        inputs = self.input_conv(inputs)
 
-        return self.net(inputs)
+        # Embed timestep
+        embed_timesteps = self.timestep_embedder(timesteps)  # [B, timestep_emb_dim]
+        embed_timesteps = self.timestep_proj(embed_timesteps)  # [B, timestep_emb_dim * 4]
+        # Expand timestep embedding to spatial dimensions
+        B, _, H, W = diffused_ys.shape
+        # Insert two singleton dimensions for H and W
+        embed_timesteps = embed_timesteps[:, :, None, None]
+        # Expand to [B, timestep_emb_dim * 4, H, W]
+        embed_timesteps = embed_timesteps.expand(B, -1, H, W)
+        # Convolve timestep embeddings to [B, hidden_dim, H, W]
+        embed_timesteps = self.timestep_emb2hidden(
+            embed_timesteps)  # [B, timestep_emb_dim * 4, H, W] -> [B, hidden_dim, H, W]
+
+        # Embed spatial position
+        embed_pos = self.pos_embedding(pos)  # [B, pos_embed_dim, H, W]
+        embed_pos = self.pos_emb2hidden(embed_pos)  # [B, hidden_dim, H, W]
+
+        # Add timestep embeddings & position embeddings
+        inputs = inputs + embed_timesteps + embed_pos
+
+        # First residual block
+        residual = inputs
+        out = self.res_block1(inputs)
+        out = out + residual  # Residual connection
+        out = F.silu(out)  # Apply activation after residual
+        # out = self.res_block(inputs)
+        # Output layer
+        out = self.output_conv(out)
+
+        return out
 
 
 def build_scheduler():
@@ -161,14 +195,20 @@ def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageDownsca
     data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
 
+    # Learning rate scheduler
+    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=TOTAL_EPOCH, eta_min=1e-6
+    )
+
     model.train()
     for epoch in range(TOTAL_EPOCH):
         total_loss = 0.0
         total_samples = 0
-        for batch_xs, batch_ys, batch_masks in data_loader:
+        for batch_xs, batch_ys, batch_pos, batch_masks in data_loader:
             batch_xs = batch_xs.to(device)
             batch_ys = batch_ys.to(device)
             batch_masks = batch_masks.to(device)
+            batch_pos = batch_pos.to(device)
             batch_size = batch_xs.shape[0]
 
             # Sample random timesteps uniformly
@@ -179,8 +219,8 @@ def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageDownsca
             diffused_ys = scheduler.add_noise(original_samples=batch_ys, noise=noises,
                                               timesteps=sampled_timesteps)
 
-            # Predict noise
-            pred_noise = model.forward(diffused_ys, batch_xs, sampled_timesteps)
+            # Predict noise (pass position coordinates from dataset)
+            pred_noise = model.forward(diffused_ys, batch_xs, sampled_timesteps, pos=batch_pos)
             # Calculate masked MSE
             loss = calc_masked_mse(pred_noise, noises, batch_masks)
 
@@ -192,13 +232,18 @@ def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageDownsca
             total_samples += batch_size
 
         avg_loss = total_loss / max(total_samples, 1)
-        print(f"Epoch {epoch + 1}/{TOTAL_EPOCH}  Avg MSE Loss: {avg_loss:.6f}")
+        current_lr = opt.param_groups[0]['lr']
+        print(f"Epoch {epoch + 1}/{TOTAL_EPOCH}  Avg MSE Loss: {avg_loss:.6f}  LR: {current_lr:.6f}")
+
+        # Update learning rate
+        lr_scheduler.step()
 
     return model
 
 
 @torch.no_grad()
-def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler, xs: torch.Tensor, device: str) -> torch.Tensor:
+def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler, xs: torch.Tensor, pos: torch.Tensor,
+                    device: str) -> torch.Tensor:
     model.eval()
     B, _, H, W = xs.shape
     ys = torch.randn(B, OUTPUT_CHANNEL_NUM, H, W, device=device)
@@ -211,7 +256,7 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler, xs: torch.T
     for timestep in scheduler.timesteps:
         timesteps = torch.full((B,), timestep.item(), device=device, dtype=torch.long)
         # Predict noise
-        pred_noises = model.forward(ys, xs, timesteps)
+        pred_noises = model.forward(ys, xs, timesteps, pos=pos)
         # One reverse step
         step_out = scheduler.step(model_output=pred_noises, timestep=timestep, sample=ys)
         ys = step_out.prev_sample
@@ -223,11 +268,12 @@ def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageDowns
     example_num = 5
     data_loader = DataLoader(dataset, batch_size=len(dataset))
 
-    xs, true_ys, _ = next(iter(data_loader))
+    xs, true_ys, pos, _ = next(iter(data_loader))
     xs = xs.to(device)
     true_ys = true_ys.to(device)
+    pos = pos.to(device)
     with torch.no_grad():
-        pred_ys = reverse_diffuse(model, scheduler, xs, device=device)
+        pred_ys = reverse_diffuse(model, scheduler, xs, pos, device=device)
 
     for i in range(min(example_num, xs.shape[0])):
         print(f"  True Y range: [{true_ys[i].min().item():.4f}, {true_ys[i].max().item():.4f}]")
@@ -247,6 +293,11 @@ def main():
     scheduler = build_scheduler()
     model_save_path = ROOT_PATH + "/Checkpoint/ImageDownscale/Diffusers"
 
+    lat_min = 33.0
+    lat_max = 49.0
+    lon_min = -120.0
+    lon_max = -103.0
+
     # Train on 64x64 data
     print("=" * 60)
     print("Training on 64x64 data...")
@@ -255,30 +306,47 @@ def main():
         sample_total_num=1000,
         missing_prob=0.2,
         image_height=64,
-        image_width=64
+        image_width=64,
+        lat_min=lat_min,
+        lat_max=lat_max,
+        lon_min=lon_min,
+        lon_max=lon_max
     )
-    model = NoisePredictor(input_channel_num=INPUT_CHANNEL_NUM, hidden_dim=64, timestep_emb_dim=64).to(device)
+
+    model = NoisePredictor(
+        input_channel_num=INPUT_CHANNEL_NUM,
+        hidden_dim=64,
+        timestep_emb_dim=64,
+        pos_embed_dim=32
+    ).to(device)
     model = train(model, scheduler, train_dataset, device)
     model.save_pretrained(model_save_path)
 
     # Predict on 256x256
+    # Use the same boundary coordinates as training data
     model = NoisePredictor.from_pretrained(model_save_path).to(device)
-    print("\n" + "=" * 60)
-    print("Predicting on 256x256 data...")
-    print("=" * 60)
-    test_dataset_256 = ImageDownscaleDataset(
-        sample_total_num=10,
-        seed=626,
-        image_height=256,
-        image_width=256
-    )
-    true_ys, pred_ys = predict(model, scheduler, test_dataset_256, device)
+    for scale in [128]:
+        print("\n" + "=" * 60)
+        print(f"Predicting on {scale} * {scale} data...")
+        print("=" * 60)
+        print(f"Using same boundary coordinates: lat=[{lat_min}, {lat_max}], lon=[{lon_min}, {lon_max}]")
+        test_dataset_256 = ImageDownscaleDataset(
+            sample_total_num=10,
+            seed=626,
+            image_height=scale,
+            image_width=scale,
+            lat_min=lat_min,  # Same boundaries as training
+            lat_max=lat_max,
+            lon_min=lon_min,
+            lon_max=lon_max
+        )
+        true_ys, pred_ys = predict(model, scheduler, test_dataset_256, device)
 
-    # Evaluate
-    true_ys = true_ys.view(true_ys.shape[0], -1)
-    pred_ys = pred_ys.view(pred_ys.shape[0], -1)
+        # Evaluate
+        true_ys = true_ys.view(true_ys.shape[0], -1)
+        pred_ys = pred_ys.view(pred_ys.shape[0], -1)
 
-    evaluate(true_ys, pred_ys)
+        evaluate(true_ys, pred_ys)
 
 
 if __name__ == "__main__":
