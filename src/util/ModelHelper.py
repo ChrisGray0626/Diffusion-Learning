@@ -149,3 +149,37 @@ def calc_masked_mse(preds: torch.Tensor, targets: torch.Tensor, masks: torch.Ten
     mse = (mse.sum(dim=(1, 2, 3)) / torch.clamp(masks.sum(dim=(1, 2, 3)), min=1.0)).mean()
 
     return mse
+
+
+class EarlyStopping:
+
+    def __init__(self, patience: int = 5, min_delta: float = 0.0, restore_best_weights: bool = True):
+        """
+        Args:
+            patience: 验证集损失不再改善时等待的epoch数
+            min_delta: 被认为是改善的最小变化量
+            restore_best_weights: 是否在早停时恢复最佳权重
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best_weights = restore_best_weights
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.best_weights = None
+        self.early_stop = False
+
+    def __call__(self, val_loss: float, model: nn.Module) -> bool:
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            if self.restore_best_weights:
+                self.best_weights = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            self.counter += 1
+
+        if self.counter >= self.patience:
+            self.early_stop = True
+            if self.restore_best_weights and self.best_weights is not None:
+                model.load_state_dict(self.best_weights)
+            return True
+        return False
