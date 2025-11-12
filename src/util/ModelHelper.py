@@ -125,10 +125,20 @@ class SimpleResBlock(nn.Module):
         return x + self.net(x)
 
 
-def evaluate(true_ys: torch.Tensor, pred_ys: torch.Tensor):
+def evaluate(true_ys: torch.Tensor, pred_ys: torch.Tensor, masks: torch.Tensor = None):
+    true_ys = true_ys.view(-1)
+    pred_ys = pred_ys.view(-1)
+
+    if masks is not None:
+        masks = masks.view(-1)
+        valid_masks = masks > 0
+        true_ys = true_ys[valid_masks]
+        pred_ys = pred_ys[valid_masks]
+
     mse = functional.mse_loss(pred_ys, true_ys)
     rmse = torch.sqrt(mse)
     r2 = 1 - torch.sum((true_ys - pred_ys) ** 2) / torch.sum((true_ys - torch.mean(true_ys)) ** 2)
+
     print(f"Evaluation MSE: {mse.item():.6f}")
     print(f"Evaluation RMSE: {rmse.item():.6f}")
     print(f"Evaluation R2: {r2.item():.6f}")

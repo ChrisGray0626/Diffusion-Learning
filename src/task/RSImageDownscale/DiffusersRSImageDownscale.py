@@ -3,10 +3,9 @@
 """
   @Description Diffusers-Channel Attention-CNN Based Image Downscaling Task
   @Author Chris
-  @Date 2025/11/05
+  @Date 2025/11/12
 """
 
-import numpy as np
 import torch
 import torch.nn as nn
 from diffusers import DDPMScheduler
@@ -16,7 +15,8 @@ from torch.utils.data import Dataset, DataLoader
 
 from constant import ROOT_PATH
 from task.ImageDownscale.Module import ChannelAttention, ResBlock
-from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_masked_mse, PosEmbedding, EarlyStopping
+from task.RSImageDownscale.Dataset import RSImageDownscaleDataset
+from util.ModelHelper import SinusoidalPosEmb, calc_masked_mse, PosEmbedding, EarlyStopping, evaluate
 
 # Dataset setting
 INPUT_CHANNEL_NUM = 5
@@ -29,70 +29,12 @@ BETA_END = 0.02
 
 # Train setting
 TOTAL_EPOCH = 50
-BATCH_SIZE = 32
+BATCH_SIZE = 1
 LR = 2e-4
 
 # Early stopping setting
 PATIENCE = 5
 MIN_DELTA = 1e-6
-
-
-class ImageDownscaleDataset(Dataset):
-    def __init__(self, sample_total_num, seed=42,
-                 missing_prob: float = 0.1,
-                 image_height: int = 64,
-                 image_width: int = 64,
-                 lat_min: float = -90.0,
-                 lat_max: float = 90.0,
-                 lon_min: float = -180.0,
-                 lon_max: float = 180.0):
-
-        rng = np.random.RandomState(seed)
-        self.image_height = image_height
-        self.image_width = image_width
-
-        # Build X & Y
-        self.xs = rng.uniform(-1, 1, size=(sample_total_num, image_height, image_width, INPUT_CHANNEL_NUM)).astype(
-            np.float32)  # [B, H, W, IC]
-        ys = (
-                np.sin(self.xs[:, :, :, 0]) * 0.5
-                + 0.3 * self.xs[:, :, :, 1] ** 2
-                - 0.2 * self.xs[:, :, :, 2]
-                + 0.2 * np.cos(self.xs[:, :, :, 3] * np.pi)
-                + 0.1 * self.xs[:, :, :, 0] * self.xs[:, :, :, 4]
-                + 0.05 * rng.normal(size=(sample_total_num, image_height, image_width))
-        ).astype(np.float32)  # [B, H, W, OC]
-        self.ys = ys.reshape(sample_total_num, image_height, image_width, OUTPUT_CHANNEL_NUM)
-
-        # Build spatial position grid
-        lats = np.linspace(lat_min, lat_max, image_height)  # [H]
-        lons = np.linspace(lon_min, lon_max, image_width)  # [W]
-        lat_grid, lon_grid = np.meshgrid(lats, lons, indexing='ij')  # [H, W]
-        self.pos = np.stack([lat_grid, lon_grid], axis=-1).astype(np.float32)  # [H, W, 2]
-
-        # Build mask
-        if missing_prob > 0:
-            # Bernoulli sampling
-            masks = rng.binomial(1, 1.0 - missing_prob,
-                                 size=(sample_total_num, image_height, image_width, 1))
-        else:
-            masks = np.ones((sample_total_num, image_height, image_width, 1))
-        self.masks = masks.astype(np.float32)  # [B, H, W, 1]
-
-        # Mask X & Y
-        self.xs = self.xs * self.masks  # [B, H, W, IC]
-        self.ys = self.ys * self.masks  # [B, H, W, OC]
-
-    def __len__(self):
-        return len(self.xs)
-
-    def __getitem__(self, idx):
-        xs = torch.from_numpy(self.xs[idx]).permute(2, 0, 1)  # [H, W, IC] -> [IC, H, W]
-        ys = torch.from_numpy(self.ys[idx]).permute(2, 0, 1)  # [H, W, OC] -> [OC, H, W]
-        pos = torch.from_numpy(self.pos).permute(2, 0, 1)  # [H, W, 2] -> [2, H, W]
-        masks = torch.from_numpy(self.masks[idx]).permute(2, 0, 1)  # [H, W, 1] -> [1, H, W]
-
-        return xs, ys, pos, masks
 
 
 class NoisePredictor(ModelMixin, ConfigMixin):
@@ -226,6 +168,23 @@ class Trainer:
 
             # Calculate masked MSE
             loss = calc_masked_mse(pred_noise, noises, batch_masks)
+
+            # Check if loss is valid and requires grad
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"WARNING: Invalid loss detected: {loss.item()}")
+                print(f"  batch_masks sum: {batch_masks.sum().item()}")
+                continue
+
+            if not loss.requires_grad:
+                print(f"WARNING: Loss does not require grad! Loss value: {loss.item()}")
+                print(f"  pred_noise requires_grad: {pred_noise.requires_grad}")
+                print(f"  batch_masks sum: {batch_masks.sum().item()}")
+                # Try to create a loss with gradient
+                loss = (pred_noise * 0.0).sum() + loss
+                if not loss.requires_grad:
+                    print(f"  Still no gradient after fix, skipping batch")
+                    continue
+
             total_loss += loss.item() * B
             total_samples += B
 
@@ -321,10 +280,11 @@ def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, d
     example_num = 5
     data_loader = DataLoader(dataset, batch_size=len(dataset))  # type: ignore[arg-type]
 
-    xs, true_ys, pos, _ = next(iter(data_loader))
+    xs, true_ys, pos, masks = next(iter(data_loader))
     xs = xs.to(device)
     true_ys = true_ys.to(device)
     pos = pos.to(device)
+    masks = masks.to(device)
     with torch.no_grad():
         pred_ys = reverse_diffuse(model, scheduler, xs, pos, device=device)
 
@@ -332,7 +292,7 @@ def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, d
         print(f"  True Y range: [{true_ys[i].min().item():.4f}, {true_ys[i].max().item():.4f}]")
         print(f"  Pred Y range: [{pred_ys[i].min().item():.4f}, {pred_ys[i].max().item():.4f}]")
 
-    return true_ys, pred_ys
+    return true_ys, pred_ys, masks
 
 
 def main():
@@ -344,7 +304,7 @@ def main():
     print(f"Device: {device}")
 
     scheduler = build_scheduler()
-    model_save_path = ROOT_PATH + "/Checkpoint/ImageDownscale/Diffusers"
+    model_save_path = ROOT_PATH + "/Checkpoint/RSImageDownscale/Diffusers"
 
     lat_min = 33.0
     lat_max = 49.0
@@ -353,19 +313,10 @@ def main():
 
     # Train on 64x64 data
     print("=" * 60)
-    print("Training on 64x64 data...")
+    print("Training on 36km data...")
     print("=" * 60)
 
-    full_dataset = ImageDownscaleDataset(
-        sample_total_num=1000,
-        missing_prob=0.7,
-        image_height=64,
-        image_width=64,
-        lat_min=lat_min,
-        lat_max=lat_max,
-        lon_min=lon_min,
-        lon_max=lon_max
-    )
+    full_dataset = RSImageDownscaleDataset()
 
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
@@ -392,29 +343,15 @@ def main():
     model = trainer.run()
     model.save_pretrained(model_save_path)
 
-    # Predict on 128x128 data
+    # Predict
     model = NoisePredictor.from_pretrained(model_save_path).to(device)
-    for scale in [128]:
-        print("\n" + "=" * 60)
-        print(f"Predicting on {scale} * {scale} data...")
-        print("=" * 60)
-        test_dataset = ImageDownscaleDataset(
-            sample_total_num=10,
-            seed=626,
-            image_height=scale,
-            image_width=scale,
-            lat_min=lat_min,  # Same boundaries as training
-            lat_max=lat_max,
-            lon_min=lon_min,
-            lon_max=lon_max
-        )
-        true_ys, pred_ys = predict(model, scheduler, test_dataset, device)
+    print("\n" + "=" * 60)
+    print(f"Predicting ...")
+    print("=" * 60)
+    true_ys, pred_ys, masks = predict(model, scheduler, full_dataset, device)
 
-        # Evaluate
-        true_ys = true_ys.view(true_ys.shape[0], -1)
-        pred_ys = pred_ys.view(pred_ys.shape[0], -1)
-
-        evaluate(true_ys, pred_ys)
+    # Evaluate with masks (only on valid pixels)
+    evaluate(true_ys, pred_ys, masks)
 
 
 if __name__ == "__main__":
