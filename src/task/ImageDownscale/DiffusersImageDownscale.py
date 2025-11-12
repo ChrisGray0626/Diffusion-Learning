@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  @Description Diffusers-Transformer Image Downscaling Task
+  @Description Diffusers-Channel Attention-CNN Based Image Downscaling Task
   @Author Chris
   @Date 2025/11/05
 """
@@ -15,7 +15,8 @@ from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from constant import ROOT_PATH
-from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_masked_mse, PosEmbedding, BaseResBlock
+from task.ImageDownscale.Module import ChannelAttention, ResBlock
+from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_masked_mse, PosEmbedding, EarlyStopping
 
 # Dataset setting
 INPUT_CHANNEL_NUM = 5
@@ -27,9 +28,13 @@ BETA_START = 1e-4
 BETA_END = 0.02
 
 # Train setting
-TOTAL_EPOCH = 20
+TOTAL_EPOCH = 50
 BATCH_SIZE = 32
 LR = 2e-4
+
+# Early stopping setting
+PATIENCE = 5
+MIN_DELTA = 1e-6
 
 
 class ImageDownscaleDataset(Dataset):
@@ -90,27 +95,14 @@ class ImageDownscaleDataset(Dataset):
         return xs, ys, pos, masks
 
 
-class ResBlock(BaseResBlock):
-
-    def __init__(self, dim):
-        super().__init__(dim)
-        self.net = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-            nn.GroupNorm(8, dim),
-            nn.SiLU(),
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-            nn.GroupNorm(8, dim),
-            nn.SiLU(),
-        )
-
-
 class NoisePredictor(ModelMixin, ConfigMixin):
 
     @register_to_config
     def __init__(self, input_channel_num, output_channel_num: int = 1, hidden_dim: int = 128,
                  timestep_emb_dim: int = 128, pos_embed_dim: int = 64,
                  lat_min: float = -90.0, lat_max: float = 90.0,
-                 lon_min: float = -180.0, lon_max: float = 180.0):
+                 lon_min: float = -180.0, lon_max: float = 180.0,
+                 channel_attention_reduction: int = 16):
         super().__init__()
         self.input_channel_num = input_channel_num
         self.hidden_dim = hidden_dim
@@ -140,7 +132,9 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         )
 
         self.net = nn.Sequential(
+            ChannelAttention(dim=hidden_dim, reduction=channel_attention_reduction),
             ResBlock(hidden_dim),
+            ChannelAttention(dim=hidden_dim, reduction=channel_attention_reduction),
             nn.Conv2d(hidden_dim, 1, kernel_size=3, padding=1)
         )
 
@@ -182,8 +176,107 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         return out
 
 
-def build_scheduler():
-    scheduler = DDPMScheduler(
+class Trainer:
+
+    def __init__(self, model: NoisePredictor, scheduler: DDPMScheduler,
+                 train_dataset: Dataset,
+                 val_dataset: Dataset,
+                 device: str,
+                 early_stopping: EarlyStopping,
+                 total_epoch: int,
+                 batch_size: int, lr: float):
+        self.model = model
+        self.scheduler = scheduler
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.device = device
+        self.early_stopping = early_stopping
+        self.total_epoch = total_epoch
+        self.batch_size = batch_size
+        self.lr = lr
+
+    def evaluate_epoch(self, data_loader: DataLoader, optimizer: torch.optim.Optimizer = None) -> float:
+        total_loss = 0.0
+        total_samples = 0
+
+        for batch_xs, batch_ys, batch_pos, batch_masks in data_loader:
+            batch_xs = batch_xs.to(self.device)
+            batch_ys = batch_ys.to(self.device)
+            batch_masks = batch_masks.to(self.device)
+            batch_pos = batch_pos.to(self.device)
+
+            B = batch_xs.shape[0]
+
+            # Sample random timesteps uniformly
+            sampled_timesteps = torch.randint(
+                0, self.scheduler.config['num_train_timesteps'],
+                (B,), device=self.device, dtype=torch.long
+            )
+
+            # Forward diffuse
+            noises = torch.randn_like(batch_ys)
+            diffused_ys = self.scheduler.add_noise(
+                original_samples=batch_ys,
+                noise=noises,
+                timesteps=sampled_timesteps  # type: ignore[arg-type]
+            )
+
+            # Predict noise
+            pred_noise = self.model.forward(diffused_ys, batch_xs, sampled_timesteps, pos=batch_pos)
+
+            # Calculate masked MSE
+            loss = calc_masked_mse(pred_noise, noises, batch_masks)
+            total_loss += loss.item() * B
+            total_samples += B
+
+            # If train phrase, perform optimization step
+            if optimizer is not None:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+        avg_loss = total_loss / max(total_samples, 1)
+
+        return avg_loss
+
+    def run(self):
+
+        # Optimizer
+        opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
+        # Learning rate scheduler
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=self.total_epoch, eta_min=1e-6
+        )
+
+        train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, drop_last=True)
+        val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False)
+        for epoch in range(self.total_epoch):
+            # Training phase
+            self.model.train()
+            train_loss = self.evaluate_epoch(train_loader, optimizer=opt)
+            current_lr = opt.param_groups[0]['lr']
+
+            # Validation phase
+            self.model.eval()
+            val_loss = self.evaluate_epoch(val_loader, optimizer=None)
+
+            print(
+                f"Epoch {epoch + 1}/{self.total_epoch} Train Loss: {train_loss:.6f} Val Loss: {val_loss:.6f} LR: {current_lr:.6f}")
+
+            # Early stopping check
+            if self.early_stopping(val_loss, self.model):
+                print(
+                    f"Early stopping triggered at epoch {epoch + 1}. Best val loss: {self.early_stopping.best_loss:.6f}")
+                break
+
+            # Update learning rate
+            lr_scheduler.step()
+
+        return self.model
+
+
+def build_scheduler() -> DDPMScheduler:
+    return DDPMScheduler(
         num_train_timesteps=STEP_TOTAL_NUM,
         beta_start=BETA_START,
         beta_end=BETA_END,
@@ -192,57 +285,13 @@ def build_scheduler():
         clip_sample=False,
     )
 
-    return scheduler
 
-
-def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageDownscaleDataset, device: str):
-    data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-
-    # Learning rate scheduler
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=TOTAL_EPOCH, eta_min=1e-6
+def build_early_stopping() -> EarlyStopping:
+    return EarlyStopping(
+        patience=PATIENCE,
+        min_delta=MIN_DELTA,
+        restore_best_weights=True
     )
-
-    model.train()
-    for epoch in range(TOTAL_EPOCH):
-        total_loss = 0.0
-        total_samples = 0
-        for batch_xs, batch_ys, batch_pos, batch_masks in data_loader:
-            batch_xs = batch_xs.to(device)
-            batch_ys = batch_ys.to(device)
-            batch_masks = batch_masks.to(device)
-            batch_pos = batch_pos.to(device)
-            batch_size = batch_xs.shape[0]
-
-            # Sample random timesteps uniformly
-            sampled_timesteps = torch.randint(0, scheduler.config['num_train_timesteps'], (batch_size,), device=device)
-
-            # Forward diffuse
-            noises = torch.randn_like(batch_ys)
-            diffused_ys = scheduler.add_noise(original_samples=batch_ys, noise=noises,
-                                              timesteps=sampled_timesteps)
-
-            # Predict noise (pass position coordinates from dataset)
-            pred_noise = model.forward(diffused_ys, batch_xs, sampled_timesteps, pos=batch_pos)
-            # Calculate masked MSE
-            loss = calc_masked_mse(pred_noise, noises, batch_masks)
-
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
-            total_loss += loss.item() * batch_size
-            total_samples += batch_size
-
-        avg_loss = total_loss / max(total_samples, 1)
-        current_lr = opt.param_groups[0]['lr']
-        print(f"Epoch {epoch + 1}/{TOTAL_EPOCH}  Avg MSE Loss: {avg_loss:.6f}  LR: {current_lr:.6f}")
-
-        # Update learning rate
-        lr_scheduler.step()
-
-    return model
 
 
 @torch.no_grad()
@@ -268,9 +317,9 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler, xs: torch.T
     return ys
 
 
-def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageDownscaleDataset, device: str):
+def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, device: str):
     example_num = 5
-    data_loader = DataLoader(dataset, batch_size=len(dataset))
+    data_loader = DataLoader(dataset, batch_size=len(dataset))  # type: ignore[arg-type]
 
     xs, true_ys, pos, _ = next(iter(data_loader))
     xs = xs.to(device)
@@ -306,7 +355,8 @@ def main():
     print("=" * 60)
     print("Training on 64x64 data...")
     print("=" * 60)
-    train_dataset = ImageDownscaleDataset(
+
+    full_dataset = ImageDownscaleDataset(
         sample_total_num=1000,
         missing_prob=0.2,
         image_height=64,
@@ -317,6 +367,13 @@ def main():
         lon_max=lon_max
     )
 
+    train_size = int(0.8 * len(full_dataset))
+    val_size = len(full_dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+
     model = NoisePredictor(
         input_channel_num=INPUT_CHANNEL_NUM,
         hidden_dim=128,
@@ -325,12 +382,17 @@ def main():
         lat_min=lat_min,
         lat_max=lat_max,
         lon_min=lon_min,
-        lon_max=lon_max
+        lon_max=lon_max,
+        channel_attention_reduction=16,
     ).to(device)
-    model = train(model, scheduler, train_dataset, device)
+
+    early_stopping = build_early_stopping()
+    trainer = Trainer(model, scheduler, train_dataset, val_dataset, device=device, early_stopping=early_stopping,
+                      total_epoch=TOTAL_EPOCH, batch_size=BATCH_SIZE, lr=LR)
+    model = trainer.run()
     model.save_pretrained(model_save_path)
 
-    # Predict on 256x256
+    # Predict on 128x128 data
     model = NoisePredictor.from_pretrained(model_save_path).to(device)
     for scale in [128]:
         print("\n" + "=" * 60)
