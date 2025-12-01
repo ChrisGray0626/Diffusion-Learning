@@ -7,9 +7,14 @@
 """
 import os
 
-ROOT_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_DIR_PATH = os.path.join(ROOT_PATH, "Data")
-TRAIN_DATA_DIR_PATH = os.path.join(DATA_DIR_PATH, "Train")
+# 基础路径
+PROJ_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR_PATH = "/Volumes/Elements SE/Data/Downscale-DM"
+RAW_DIR_PATH: str = os.path.join(DATA_DIR_PATH, "Raw/2016-2020")
+PROCESSED_DIR_PATH = os.path.join(DATA_DIR_PATH, "Processed")
+RESULT_PATH: str = os.path.join(PROJ_PATH, "Result")
+
+VALID_DATE_FILE_PATH = os.path.join(DATA_DIR_PATH, "ValidDate.txt")
 
 DATE_NAME = "Date"
 LONGITUDE_NAME = "Lon"

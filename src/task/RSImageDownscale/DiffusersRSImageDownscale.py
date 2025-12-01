@@ -5,7 +5,7 @@
   @Author Chris
   @Date 2025/11/12
 """
-
+import numpy as np
 import torch
 import torch.nn as nn
 from diffusers import DDPMScheduler
@@ -13,7 +13,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from constant import ROOT_PATH
+from Constant import PROJ_PATH
 from task.ImageDownscale.Module import ChannelAttention, ResBlock
 from task.RSImageDownscale.Dataset import RSImageDownscaleDataset
 from util.ModelHelper import SinusoidalPosEmb, calc_masked_mse, PosEmbedding, EarlyStopping, evaluate
@@ -169,21 +169,21 @@ class Trainer:
             # Calculate masked MSE
             loss = calc_masked_mse(pred_noise, noises, batch_masks)
 
-            # Check if loss is valid and requires grad
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"WARNING: Invalid loss detected: {loss.item()}")
-                print(f"  batch_masks sum: {batch_masks.sum().item()}")
-                continue
-
-            if not loss.requires_grad:
-                print(f"WARNING: Loss does not require grad! Loss value: {loss.item()}")
-                print(f"  pred_noise requires_grad: {pred_noise.requires_grad}")
-                print(f"  batch_masks sum: {batch_masks.sum().item()}")
-                # Try to create a loss with gradient
-                loss = (pred_noise * 0.0).sum() + loss
-                if not loss.requires_grad:
-                    print(f"  Still no gradient after fix, skipping batch")
-                    continue
+            # # Check if loss is valid and requires grad
+            # if torch.isnan(loss) or torch.isinf(loss):
+            #     print(f"WARNING: Invalid loss detected: {loss.item()}")
+            #     print(f"  batch_masks sum: {batch_masks.sum().item()}")
+            #     continue
+            #
+            # if not loss.requires_grad:
+            #     print(f"WARNING: Loss does not require grad! Loss value: {loss.item()}")
+            #     print(f"  pred_noise requires_grad: {pred_noise.requires_grad}")
+            #     print(f"  batch_masks sum: {batch_masks.sum().item()}")
+            #     # Try to create a loss with gradient
+            #     loss = (pred_noise * 0.0).sum() + loss
+            #     if not loss.requires_grad:
+            #         print(f"  Still no gradient after fix, skipping batch")
+            #         continue
 
             total_loss += loss.item() * B
             total_samples += B
@@ -277,20 +277,30 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler, xs: torch.T
 
 
 def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, device: str):
-    example_num = 5
     data_loader = DataLoader(dataset, batch_size=len(dataset))  # type: ignore[arg-type]
 
-    xs, true_ys, pos, masks = next(iter(data_loader))
+    xs, true_ys_normalized, pos, masks = next(iter(data_loader))
     xs = xs.to(device)
-    true_ys = true_ys.to(device)
+    true_ys_normalized = true_ys_normalized.to(device)
     pos = pos.to(device)
     masks = masks.to(device)
-    with torch.no_grad():
-        pred_ys = reverse_diffuse(model, scheduler, xs, pos, device=device)
 
-    for i in range(min(example_num, xs.shape[0])):
-        print(f"  True Y range: [{true_ys[i].min().item():.4f}, {true_ys[i].max().item():.4f}]")
-        print(f"  Pred Y range: [{pred_ys[i].min().item():.4f}, {pred_ys[i].max().item():.4f}]")
+    with torch.no_grad():
+        pred_ys_normalized = reverse_diffuse(model, scheduler, xs, pos, device=device)
+
+    true_ys_np = true_ys_normalized.cpu().numpy()  # [B, 1, H, W]
+    pred_ys_np = pred_ys_normalized.cpu().numpy()  # [B, 1, H, W]
+
+    true_ys_denorm = []
+    pred_ys_denorm = []
+    for i in range(true_ys_np.shape[0]):
+        sm_2d_true = true_ys_np[i, 0]  # [H, W]
+        sm_2d_pred = pred_ys_np[i, 0]  # [H, W]
+        true_ys_denorm.append(dataset.denormalize_sm(sm_2d_true))  # [H, W]
+        pred_ys_denorm.append(dataset.denormalize_sm(sm_2d_pred))  # [H, W]
+
+    true_ys = torch.from_numpy(np.array(true_ys_denorm)[:, np.newaxis, :, :]).to(device)  # [B, 1, H, W]
+    pred_ys = torch.from_numpy(np.array(pred_ys_denorm)[:, np.newaxis, :, :]).to(device)  # [B, 1, H, W]
 
     return true_ys, pred_ys, masks
 
@@ -304,7 +314,7 @@ def main():
     print(f"Device: {device}")
 
     scheduler = build_scheduler()
-    model_save_path = ROOT_PATH + "/Checkpoint/RSImageDownscale/Diffusers"
+    model_save_path = PROJ_PATH + "/Checkpoint/RSImageDownscale/Diffusers"
 
     lat_min = 33.0
     lat_max = 49.0

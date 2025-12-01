@@ -15,7 +15,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from constant import ROOT_PATH
+from Constant import ROOT_PATH
 from util.ModelHelper import SinusoidalPosEmb, SimpleResBlock, evaluate
 
 # Dataset setting
