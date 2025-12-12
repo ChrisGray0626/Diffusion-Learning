@@ -13,9 +13,9 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from Constant import PROJ_PATH
+from Constant import PROJ_PATH, RANGE
 from task.RSImageDownscale.Dataset import RSImageDownscaleDataset
-from task.RSImageDownscale.Module import TimeEmbedding, SpatialEmbedding, FeatureAttention
+from task.RSImageDownscale.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
 from util.ModelHelper import SinusoidalPosEmb, EarlyStopping, evaluate
 
 # Dataset setting
@@ -49,17 +49,16 @@ class NoisePredictor(ModelMixin, ConfigMixin):
     @register_to_config
     def __init__(self, input_feature_num: int = 5, pos_feature_num: int = 2,
                  hidden_dim: int = 512, timestep_emb_dim: int = 128,
-                 num_heads: int = 8, num_attention_layers: int = 2):
+                 num_res_blocks: int = 3):
         """
-        基于记录的地理回归模型（集成DOY周期编码和RFF空间嵌入）
+        基于记录的地理回归模型（集成时间嵌入、空间嵌入和FiLM+ResBlock）
 
         Args:
             input_feature_num: 输入特征数量（如NDVI, LST等，通常为5）
             pos_feature_num: 位置特征数量（经纬度，通常为2）
             hidden_dim: 隐藏层维度
             timestep_emb_dim: 时间步嵌入维度
-            num_heads: 注意力头数
-            num_attention_layers: 注意力层数
+            num_res_blocks: ResBlock 层数
         """
         super().__init__()
         self.input_feature_num = input_feature_num
@@ -78,25 +77,35 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         )
         self.emb_timestep2hidden = nn.Linear(timestep_emb_dim * 4, hidden_dim)
 
-        # 增强时间嵌入（DOY + 年份 + 多频率 Fourier）
+        # 时间嵌入（DOY + 年份 + 多频率 Fourier）
         self.time_embedding = TimeEmbedding(
             hidden_dim=hidden_dim,
             num_fourier=8
         )
 
-        # RFF 空间嵌入
+        # 空间嵌入（确定性指数频率，分别处理经度和纬度）
+        lon_min, lat_min, lon_max, lat_max = RANGE
         self.spatial_embedding = SpatialEmbedding(
-            input_dim=pos_feature_num,
-            hidden_dim=hidden_dim
+            hidden_dim=hidden_dim,
+            num_fourier=6,
+            lon_min=lon_min,
+            lon_max=lon_max,
+            lat_min=lat_min,
+            lat_max=lat_max
         )
 
-        # Attention机制
-        self.feature_attention = FeatureAttention(
-            hidden_dim=hidden_dim,
-            num_heads=num_heads,
-            num_layers=num_attention_layers,
-            dropout=0.1
+        # 条件信息融合层（融合时间步、时间、空间嵌入）
+        self.condition_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim)
         )
+
+        # FiLM + ResBlock 层
+        self.res_blocks = nn.ModuleList([
+            FiLMResBlock(hidden_dim=hidden_dim)
+            for _ in range(num_res_blocks)
+        ])
 
         # 输出层
         self.output_layer = nn.Sequential(
@@ -110,47 +119,41 @@ class NoisePredictor(ModelMixin, ConfigMixin):
     def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
                 pos: torch.Tensor, dates: list) -> torch.Tensor:
         """
-        基于记录的地理回归前向传播（集成增强时间嵌入和RFF空间嵌入）
+        基于记录的地理回归前向传播（集成时间嵌入、空间嵌入和FiLM+ResBlock）
 
         Args:
             diffused_ys: [B, 1] - 扩散后的输出
             xs: [B, input_feature_num] - 输入特征
             timesteps: [B] - 扩散时间步
-            pos: [B, pos_feature_num] - 标准化后的坐标（[-1, 1]范围）
+            pos: [B, pos_feature_num] - 原始坐标 [lon, lat]
             dates: List[str] - 日期字符串列表，格式为 'YYYYMMDD'
         Returns:
             [B, 1] - 预测的噪声
         """
         # 输入特征（不包含位置）
         inputs = torch.cat([xs, diffused_ys], dim=1)
-        input_features = self.input_layer(inputs)
+        x = self.input_layer(inputs)
 
         # 时间步嵌入
         embed_timesteps = self.timestep_embedding(timesteps)
         embed_timesteps = self.emb_timestep2hidden(embed_timesteps)
 
-        # 增强时间嵌入（从日期字符串提取特征）
+        # 时间嵌入（从日期字符串提取特征）
         embed_time = self.time_embedding(dates)
 
-        # RFF 空间嵌入
+        # 空间嵌入
         embed_spatial = self.spatial_embedding(pos)
 
-        # 构建 token 序列
-        tokens = torch.stack([
-            input_features,
-            embed_timesteps,
-            embed_time,
-            embed_spatial
-        ], dim=1)
+        # 融合条件信息（时间步 + 时间 + 空间）
+        condition = torch.cat([embed_timesteps, embed_time, embed_spatial], dim=1)
+        condition = self.condition_fusion(condition)
 
-        # Attention 编码
-        encoded = self.feature_attention(tokens)
-
-        # 使用第一个 token（输入特征）
-        main_feature = encoded[:, 0, :]
+        # 通过多个 FiLM + ResBlock 层
+        for res_block in self.res_blocks:
+            x = res_block(x, condition)
 
         # 输出层
-        out = self.output_layer(main_feature)
+        out = self.output_layer(x)
 
         return out
 
@@ -399,8 +402,7 @@ def main():
         pos_feature_num=POS_FEATURE_NUM,
         hidden_dim=HIDDEN_DIM,
         timestep_emb_dim=TIMESTEP_EMB_DIM,
-        num_heads=8,
-        num_attention_layers=2,
+        num_res_blocks=3,
     ).to(device)
 
     early_stopping = build_early_stopping()

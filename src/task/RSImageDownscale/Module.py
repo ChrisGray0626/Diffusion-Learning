@@ -110,102 +110,149 @@ class TimeEmbedding(nn.Module):
 
 class SpatialEmbedding(nn.Module):
     """
-    Random Fourier Features (RFF) 空间嵌入：对标准化后的坐标进行多频率嵌入
+    增强的空间嵌入：使用确定性指数频率，分别处理经度和纬度
+    结合原始坐标和多频率 Fourier 编码
     """
 
-    def __init__(self, input_dim: int = 2, hidden_dim: int = 512, num_freqs: int = 64):
+    def __init__(self, hidden_dim: int = 512, num_fourier: int = 6,
+                 lon_min: float = -120, lon_max: float = -104,
+                 lat_min: float = 35, lat_max: float = 49):
         """
         Args:
-            input_dim: 输入维度（通常为2，表示经纬度）
             hidden_dim: 输出隐藏维度
-            num_freqs: 频率数量
+            num_fourier: Fourier 频率数量
+            lon_min, lon_max, lat_min, lat_max: 空间范围
         """
         super().__init__()
-        self.input_dim = input_dim
         self.hidden_dim = hidden_dim
-        self.num_freqs = num_freqs
+        self.num_fourier = num_fourier
+        self.lon_min, self.lon_max = lon_min, lon_max
+        self.lat_min, self.lat_max = lat_min, lat_max
 
-        # 随机采样频率矩阵（RFF的核心）
-        # 使用高斯分布采样，scale=1.0 是常见选择
-        B = torch.randn(input_dim, num_freqs) * 1.0
-        self.register_buffer('B', B)
+        # 特征维度：2 (原始 lon, lat) + 4 * num_fourier (每个频率对 lon/lat 的 sin/cos)
+        spatial_dim = 2 + 4 * num_fourier
 
-        # 投影层
-        self.proj = nn.Linear(num_freqs * 2, hidden_dim)
+        # 投影到隐藏维度
+        self.proj = nn.Sequential(
+            nn.Linear(spatial_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
 
     def forward(self, pos: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            pos: [B, input_dim] - 标准化后的坐标（[-1, 1]范围）
+            pos: [B, 2] - 原始坐标 [lon, lat]（未标准化）
         Returns:
             [B, hidden_dim] - 空间嵌入
         """
-        # RFF 变换：cos(2π * pos @ B)
-        # pos: [B, input_dim], B: [input_dim, num_freqs]
-        proj = 2 * torch.pi * pos @ self.B  # [B, num_freqs]
+        lon = pos[:, 0]
+        lat = pos[:, 1]
 
-        # 使用 cos 和 sin（更稳定的表示）
-        cos_emb = torch.cos(proj)  # [B, num_freqs]
-        sin_emb = torch.sin(proj)  # [B, num_freqs]
+        # 归一化到 [-1, 1]
+        lon_n = 2 * (lon - self.lon_min) / (self.lon_max - self.lon_min) - 1
+        lat_n = 2 * (lat - self.lat_min) / (self.lat_max - self.lat_min) - 1
+
+        emb_list = [lon_n.unsqueeze(1), lat_n.unsqueeze(1)]
+
+        # 多频率 Fourier 编码（分别处理 lon 和 lat）
+        for k in range(self.num_fourier):
+            freq = 2 ** k
+            emb_list.append(torch.sin(freq * torch.pi * lon_n).unsqueeze(1))
+            emb_list.append(torch.cos(freq * torch.pi * lon_n).unsqueeze(1))
+            emb_list.append(torch.sin(freq * torch.pi * lat_n).unsqueeze(1))
+            emb_list.append(torch.cos(freq * torch.pi * lat_n).unsqueeze(1))
 
         # 拼接
-        rff = torch.cat([cos_emb, sin_emb], dim=-1)  # [B, num_freqs * 2]
+        spatial_emb = torch.cat(emb_list, dim=1)
 
         # 投影到隐藏维度
-        out = self.proj(rff)  # [B, hidden_dim]
+        out = self.proj(spatial_emb)
 
         return out
 
 
-class FeatureAttention(nn.Module):
+class FiLM(nn.Module):
     """
-    简化的特征注意力模块：只使用MultiheadAttention，不使用完整的Transformer
-    适用于短序列（如3个token），更高效且参数更少
+    Feature-wise Linear Modulation (FiLM): 使用条件信息调制特征
     """
 
-    def __init__(self, hidden_dim: int = 512, num_heads: int = 8,
-                 num_layers: int = 2, dropout: float = 0.1):
+    def __init__(self, hidden_dim: int = 512):
         """
         Args:
-            hidden_dim: 隐藏维度
-            num_heads: 注意力头数
-            num_layers: 注意力层数
-            dropout: Dropout比率
+            hidden_dim: 特征维度
         """
         super().__init__()
         self.hidden_dim = hidden_dim
 
-        # 多层注意力（每层都是独立的）
-        self.attention_layers = nn.ModuleList([
-            nn.MultiheadAttention(
-                embed_dim=hidden_dim,
-                num_heads=num_heads,
-                dropout=dropout,
-                batch_first=True
-            )
-            for _ in range(num_layers)
-        ])
+        # 从条件信息生成 scale 和 shift
+        self.scale_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.shift_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
 
-        # LayerNorm（每层一个）
-        self.layer_norms = nn.ModuleList([
-            nn.LayerNorm(hidden_dim)
-            for _ in range(num_layers)
-        ])
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            tokens: [B, num_tokens, hidden_dim] - 输入token序列
+            x: [B, hidden_dim] - 输入特征
+            condition: [B, hidden_dim] - 条件信息（用于生成 scale 和 shift）
         Returns:
-            [B, num_tokens, hidden_dim] - 编码后的token序列
+            [B, hidden_dim] - 调制后的特征
         """
-        x = tokens
+        # 从条件信息生成 scale 和 shift
+        scale = self.scale_net(condition)
+        shift = self.shift_net(condition)
 
-        for attention, norm in zip(self.attention_layers, self.layer_norms):
-            # Self-attention
-            attn_out, _ = attention(x, x, x)  # [B, num_tokens, hidden_dim]
+        # FiLM 调制：scale * x + shift
+        out = scale * x + shift
 
-            # Residual connection + LayerNorm
-            x = norm(x + attn_out)
+        return out
 
-        return x
+
+class FiLMResBlock(nn.Module):
+    """
+    FiLM + ResBlock: 使用 FiLM 进行条件调制，然后通过 ResBlock 处理
+    """
+
+    def __init__(self, hidden_dim: int = 512):
+        """
+        Args:
+            hidden_dim: 隐藏维度
+        """
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # ResBlock 网络
+        self.net = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # FiLM 模块
+        self.film = FiLM(hidden_dim)
+
+    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, hidden_dim] - 输入特征
+            condition: [B, hidden_dim] - 条件信息（时间、空间等）
+        Returns:
+            [B, hidden_dim] - 输出特征
+        """
+        # FiLM 调制
+        x_modulated = self.film(x, condition)
+
+        # ResBlock
+        out = x + self.net(x_modulated)
+
+        return out

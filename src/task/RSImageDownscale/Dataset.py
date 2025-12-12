@@ -13,7 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 from Constant import DEM_NAME, RESOLUTION_36KM, TIFF_SUFFIX, STANDARD_GRID_36KM_PATH, \
-    NDVI_NAME, PRECIPITATION_NAME, ALBEDO_NAME, LST_NAME, SM_NAME, PROCESSED_DIR_PATH, RANGE
+    NDVI_NAME, PRECIPITATION_NAME, ALBEDO_NAME, LST_NAME, SM_NAME, PROCESSED_DIR_PATH
 from util.TiffHandler import read_tiff, read_tiff_data
 from util.Util import get_valid_dates
 
@@ -53,9 +53,8 @@ class RSImageDownscaleDataset(Dataset):
         pos_expanded = np.tile(pos_grid[np.newaxis, :, :, :], (date_num, 1, 1, 1))
         pos_flat = pos_expanded.reshape(date_num * H * W, -1).astype(np.float32)
 
-        lons = pos_flat[:, 1]
-        lats = pos_flat[:, 0]
-        self.pos = self._normalize_coord(lons, lats)
+        # 存储原始坐标（不归一化），让 SpatialEmbedding 模块内部处理
+        self.pos = pos_flat[:, [1, 0]]  # [lon, lat] 顺序
 
         dates = np.repeat(dates, H * W)
         self.dates = np.array(dates, dtype=object)
@@ -79,12 +78,6 @@ class RSImageDownscaleDataset(Dataset):
 
         return xs, ys
 
-    @staticmethod
-    def _normalize_coord(lons, lats):
-        lon_min, lat_min, lon_max, lat_max = RANGE
-        lon_norm = (lons - lon_min) / (lon_max - lon_min) * 2.0 - 1.0
-        lat_norm = (lats - lat_min) / (lat_max - lat_min) * 2.0 - 1.0
-        return np.stack([lon_norm, lat_norm], axis=-1).astype(np.float32)
 
     def _filter_valid(self):
         valid = ~np.isnan(self.xs).any(axis=1) & ~np.isnan(self.ys).any(axis=1)
