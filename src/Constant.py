@@ -43,3 +43,6 @@ X_COLUMN = [
 Y_COLUMN = [SM_NAME]
 
 TIFF_SUFFIX = ".tif"
+
+# 空间范围：Left Bottom Right Top
+RANGE = [-120, 35, -104, 49]

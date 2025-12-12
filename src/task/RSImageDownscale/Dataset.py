@@ -6,7 +6,6 @@
   @Date 2025/11/12
 """
 
-import glob
 import os
 
 import numpy as np
@@ -14,7 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 from Constant import DEM_NAME, RESOLUTION_36KM, TIFF_SUFFIX, STANDARD_GRID_36KM_PATH, \
-    NDVI_NAME, PRECIPITATION_NAME, ALBEDO_NAME, LST_NAME, SM_NAME, PROCESSED_DIR_PATH
+    NDVI_NAME, PRECIPITATION_NAME, ALBEDO_NAME, LST_NAME, SM_NAME, PROCESSED_DIR_PATH, RANGE
 from util.TiffHandler import read_tiff, read_tiff_data
 from util.Util import get_valid_dates
 
@@ -22,59 +21,48 @@ from util.Util import get_valid_dates
 class RSImageDownscaleDataset(Dataset):
 
     def __init__(self):
+        self._load_data()
+        self._filter_valid()
+        self._normalize_feat()
+        self.date_num = len(set(self.dates))
+
+    def _load_data(self):
         dem_path = os.path.join(PROCESSED_DIR_PATH, DEM_NAME, RESOLUTION_36KM, f'{DEM_NAME}{TIFF_SUFFIX}')
-        self.dem_data = read_tiff_data(dem_path).astype(np.float32)
-        self.image_height, self.image_width = self.dem_data.shape
+        dem_data = read_tiff_data(dem_path).astype(np.float32)
 
-        _, self.lon_grid, self.lat_grid = read_tiff(STANDARD_GRID_36KM_PATH, dst_epsg_code=4326)
-        self.pos = np.stack([self.lat_grid, self.lon_grid], axis=-1).astype(np.float32)  # [H, W, 2]
+        _, lon_grid, lat_grid = read_tiff(STANDARD_GRID_36KM_PATH, dst_epsg_code=4326)
+        pos_grid = np.stack([lat_grid, lon_grid], axis=-1).astype(np.float32)
 
-        ndvi_dir = os.path.join(PROCESSED_DIR_PATH, NDVI_NAME, RESOLUTION_36KM)
-        tif_files = glob.glob(os.path.join(ndvi_dir, f'*{TIFF_SUFFIX}'))
-        self.dates = get_valid_dates()
+        dates = get_valid_dates()
+        xs = []
+        ys = []
 
-        # Build X & Y
-        self.xs = []
-        self.ys = []
-        self.masks = []
+        for date in dates:
+            xs_date, ys_date = self._load_single_date_data(date, dem_data)
+            xs.append(xs_date)
+            ys.append(ys_date)
 
-        for date in self.dates:
-            xs_date, ys_date, mask_date = self._load_date_data(date)
-            self.xs.append(xs_date)
-            self.ys.append(ys_date)
-            self.masks.append(mask_date)
+        xs = np.array(xs).astype(np.float32)
+        ys = np.array(ys).astype(np.float32)
 
-        self.xs = np.array(self.xs).astype(np.float32)  # [num_dates, H, W, 5]
-        self.ys = np.array(self.ys).astype(np.float32)  # [num_dates, H, W, 1]
-        self.masks = np.array(self.masks).astype(np.float32)  # [num_dates, H, W, 1]
+        date_num, H, W = xs.shape[:3]
 
-        # Filter out samples with valid ratio < 0.3
-        mask_sums = self.masks.sum(axis=(1, 2, 3))  # [num_dates]
-        total_pixels = self.image_height * self.image_width
-        valid_ratios = mask_sums / total_pixels  # [num_dates]
-        valid_indices = valid_ratios >= 0.3  # [num_dates]
+        self.xs = xs.reshape(date_num * H * W, -1).astype(np.float32)
+        self.ys = ys.reshape(date_num * H * W, -1).astype(np.float32)
 
-        self.dates = [self.dates[i] for i in range(len(self.dates)) if valid_indices[i]]
-        self.xs = self.xs[valid_indices]  # [num_valid_dates, H, W, 5]
-        self.ys = self.ys[valid_indices]  # [num_valid_dates, H, W, 1]
-        self.masks = self.masks[valid_indices]  # [num_valid_dates, H, W, 1]
+        pos_expanded = np.tile(pos_grid[np.newaxis, :, :, :], (date_num, 1, 1, 1))
+        pos_flat = pos_expanded.reshape(date_num * H * W, -1).astype(np.float32)
 
-        # Normalize data
-        self._normalize_data()
+        lons = pos_flat[:, 1]
+        lats = pos_flat[:, 0]
+        self.pos = self._normalize_coord(lons, lats)
 
-        # Apply mask again after normalization
-        self.xs = self.xs * self.masks
-        self.ys = self.ys * self.masks
+        dates = np.repeat(dates, H * W)
+        self.dates = np.array(dates, dtype=object)
 
-    def denormalize_sm(self, sm_normalized: np.ndarray) -> np.ndarray:
-        if not hasattr(self, 'sm_mean') or not hasattr(self, 'sm_std'):
-            return sm_normalized
-        return sm_normalized * self.sm_std + self.sm_mean
-
-    def _load_date_data(self, date):
-        dem = self.dem_data.copy()
+    # TODO _load_single_date_data
+    def _load_single_date_data(self, date, dem_data):
         data_dict = {}
-
         for data_type in [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, SM_NAME]:
             file_path = os.path.join(PROCESSED_DIR_PATH, data_type, RESOLUTION_36KM, f'{date}{TIFF_SUFFIX}')
             data_dict[data_type] = read_tiff_data(file_path).astype(np.float32)
@@ -84,57 +72,57 @@ class RSImageDownscaleDataset(Dataset):
             data_dict[LST_NAME],
             data_dict[ALBEDO_NAME],
             data_dict[PRECIPITATION_NAME],
-            dem,
-        ], axis=-1)  # [H, W, 5]
+            dem_data,
+        ], axis=-1)
 
-        ys = data_dict[SM_NAME][:, :, np.newaxis]  # [H, W, 1]
+        ys = data_dict[SM_NAME][:, :, np.newaxis]
 
-        valid_xs = ~np.isnan(xs).any(axis=-1)  # True where xs has no NaN (valid)
-        valid_ys = ~np.isnan(ys).squeeze()  # True where ys has no NaN (valid)
-        mask = (valid_xs & valid_ys).astype(np.float32)[:, :, np.newaxis]  # [H, W, 1], 1=valid, 0=invalid
+        return xs, ys
 
-        xs = np.nan_to_num(xs, nan=0.0, posinf=0.0, neginf=0.0)
-        ys = np.nan_to_num(ys, nan=0.0, posinf=0.0, neginf=0.0)
+    @staticmethod
+    def _normalize_coord(lons, lats):
+        lon_min, lat_min, lon_max, lat_max = RANGE
+        lon_norm = (lons - lon_min) / (lon_max - lon_min) * 2.0 - 1.0
+        lat_norm = (lats - lat_min) / (lat_max - lat_min) * 2.0 - 1.0
+        return np.stack([lon_norm, lat_norm], axis=-1).astype(np.float32)
 
-        return xs, ys, mask
+    def _filter_valid(self):
+        valid = ~np.isnan(self.xs).any(axis=1) & ~np.isnan(self.ys).any(axis=1)
 
-    def _normalize_data(self):
-        """Normalize all input features (X) and SM (Y) using z-score for stable diffusion training"""
+        self.xs = self.xs[valid]
+        self.pos = self.pos[valid]
+        self.ys = self.ys[valid, 0]
+        self.dates = self.dates[valid]
+
+    def _normalize_feat(self):
         feature_names = [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME]
 
-        # Normalize input features using z-score
-        for i, name in enumerate(feature_names):
-            valid_data = self.xs[:, :, :, i][self.masks.squeeze() > 0]
-            if len(valid_data) == 0:
-                continue
-
-            mean_val = valid_data.mean()
-            std_val = valid_data.std()
+        for i, _ in enumerate(feature_names):
+            mean_val = self.xs[:, i].mean()
+            std_val = self.xs[:, i].std()
             if std_val > 0:
-                self.xs[:, :, :, i] = (self.xs[:, :, :, i] - mean_val) / std_val
+                self.xs[:, i] = (self.xs[:, i] - mean_val) / std_val
 
-        # Normalize SM (Y) using z-score for stable diffusion training
-        # Note: We save normalization params for denormalization during evaluation
-        valid_sm = self.ys[:, :, :, 0][self.masks.squeeze() > 0]
-        if len(valid_sm) > 0:
-            self.sm_mean = valid_sm.mean()
-            self.sm_std = valid_sm.std()
-            if self.sm_std > 0:
-                self.ys[:, :, :, 0] = (self.ys[:, :, :, 0] - self.sm_mean) / self.sm_std
-            else:
-                self.sm_mean = 0.0
-                self.sm_std = 1.0
+        self.sm_mean = self.ys.mean()
+        self.sm_std = self.ys.std()
+        if self.sm_std > 0:
+            self.ys = (self.ys - self.sm_mean) / self.sm_std
         else:
             self.sm_mean = 0.0
             self.sm_std = 1.0
+
+    def denormalize_sm(self, sm_normalized):
+        if not hasattr(self, 'sm_mean') or not hasattr(self, 'sm_std'):
+            return sm_normalized
+        return sm_normalized * self.sm_std + self.sm_mean
 
     def __len__(self):
         return len(self.xs)
 
     def __getitem__(self, idx):
-        xs = torch.from_numpy(self.xs[idx]).permute(2, 0, 1)  # [H, W, 5] -> [5, H, W]
-        ys = torch.from_numpy(self.ys[idx]).permute(2, 0, 1)  # [H, W, 1] -> [1, H, W]
-        pos = torch.from_numpy(self.pos).permute(2, 0, 1)  # [H, W, 2] -> [2, H, W]
-        masks = torch.from_numpy(self.masks[idx]).permute(2, 0, 1)  # [H, W, 1] -> [1, H, W]
+        xs = torch.from_numpy(self.xs[idx]).float()
+        ys = torch.tensor(self.ys[idx], dtype=torch.float32)
+        pos = torch.from_numpy(self.pos[idx]).float()
+        date = str(self.dates[idx])
 
-        return xs, ys, pos, masks
+        return xs, ys, pos, date

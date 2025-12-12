@@ -15,7 +15,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from Constant import ROOT_PATH
+from Constant import PROJ_PATH
 from util.ModelHelper import SinusoidalPosEmb, SimpleResBlock, evaluate
 
 # Dataset setting
@@ -185,7 +185,7 @@ def main():
     print(f"Device: {device}")
 
     scheduler = build_scheduler()
-    model_save_path = ROOT_PATH + "/Checkpoint/SimpleRegression/Diffusers"
+    model_save_path = PROJ_PATH + "/Checkpoint/SimpleRegression/Diffusers"
 
     # Train
     train_dataset = SimpleRegressionDataset(sample_total_num=10000)
