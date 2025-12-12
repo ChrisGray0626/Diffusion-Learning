@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  @Description Diffusers-Based Geographic Regression Task
+  @Description Diffusers.bak-Based Geographic Regression Task
   基于扩散模型的地理回归任务：以记录为单位，经纬度直接作为自变量参与回归
   @Author Chris
   @Date 2025/11/12
@@ -338,29 +338,15 @@ def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, d
         )
         pred_ys_normalized = pred_ys_normalized.squeeze(1)  # [N, 1] -> [N]
 
-    # 诊断信息：归一化尺度上的MSE
-    mse_normalized = nn.functional.mse_loss(pred_ys_normalized, true_ys_normalized).item()
-    print(f"\n诊断信息（归一化尺度）:")
-    print(f"  - 预测值范围: [{pred_ys_normalized.min().item():.4f}, {pred_ys_normalized.max().item():.4f}]")
-    print(f"  - 真实值范围: [{true_ys_normalized.min().item():.4f}, {true_ys_normalized.max().item():.4f}]")
-    print(f"  - MSE (归一化尺度): {mse_normalized:.6f}")
-
     # 反归一化
     true_ys_np = true_ys_normalized.cpu().numpy()  # [N]
     pred_ys_np = pred_ys_normalized.cpu().numpy()  # [N]
 
-    true_ys_denorm = dataset.denormalize_sm(true_ys_np)  # [N]
-    pred_ys_denorm = dataset.denormalize_sm(pred_ys_np)  # [N]
+    true_ys_denorm = dataset.dataset.denormalize_sm(true_ys_np)  # [N]
+    pred_ys_denorm = dataset.dataset.denormalize_sm(pred_ys_np)  # [N]
 
     true_ys = torch.from_numpy(true_ys_denorm).to(device)  # [N]
     pred_ys = torch.from_numpy(pred_ys_denorm).to(device)  # [N]
-
-    # 诊断信息：归一化参数
-    if hasattr(dataset, 'sm_mean') and hasattr(dataset, 'sm_std'):
-        print(f"  - 归一化参数: mean={dataset.sm_mean:.4f}, std={dataset.sm_std:.4f}")
-        print(
-            f"  - 归一化尺度MSE ({mse_normalized:.6f}) × std² ({dataset.sm_std ** 2:.6f}) = {mse_normalized * dataset.sm_std ** 2:.6f}")
-        print(f"  - 这应该接近原始尺度的MSE\n")
 
     return true_ys, pred_ys
 
@@ -391,9 +377,10 @@ def main():
     print()
 
     train_size = int(0.8 * len(full_dataset))
-    val_size = len(full_dataset) - train_size
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size],
+    val_size = int(0.1 * len(full_dataset))
+    test_size = len(full_dataset) - train_size - val_size
+    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+        full_dataset, [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(42)
     )
 
@@ -416,7 +403,7 @@ def main():
     print("\n" + "=" * 60)
     print(f"Predicting ...")
     print("=" * 60)
-    true_ys, pred_ys = predict(model, scheduler, full_dataset, device)
+    true_ys, pred_ys = predict(model, scheduler, test_dataset, device)
 
     # Evaluate (所有记录都是有效的，不需要mask)
     # evaluate函数可以处理展平的张量
