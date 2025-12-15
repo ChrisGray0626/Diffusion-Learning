@@ -14,9 +14,9 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from Constant import ROOT_PATH
+from Constant import PROJ_PATH
 from task.ImageDownscale.Module import ChannelAttention, ResBlock
-from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_masked_mse, PosEmbedding, EarlyStopping
+from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_mse, PosEmbedding, EarlyStopping
 
 # Dataset setting
 INPUT_CHANNEL_NUM = 5
@@ -225,7 +225,7 @@ class Trainer:
             pred_noise = self.model.forward(diffused_ys, batch_xs, sampled_timesteps, pos=batch_pos)
 
             # Calculate masked MSE
-            loss = calc_masked_mse(pred_noise, noises, batch_masks)
+            loss = calc_mse(pred_noise, noises, batch_masks)
             total_loss += loss.item() * B
             total_samples += B
 
@@ -344,7 +344,7 @@ def main():
     print(f"Device: {device}")
 
     scheduler = build_scheduler()
-    model_save_path = ROOT_PATH + "/Checkpoint/ImageDownscale/Diffusers"
+    model_save_path = PROJ_PATH + "/Checkpoint/ImageDownscale/Diffusers"
 
     lat_min = 33.0
     lat_max = 49.0

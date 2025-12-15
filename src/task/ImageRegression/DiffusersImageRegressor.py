@@ -14,8 +14,8 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from Constant import ROOT_PATH
-from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_masked_mse
+from Constant import PROJ_PATH
+from util.ModelHelper import SinusoidalPosEmb, evaluate, calc_mse
 
 # Dataset setting
 INPUT_CHANNEL_NUM = 5
@@ -180,7 +180,7 @@ def train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: ImageRegress
             # Predict noise
             pred_noise = model.forward(diffused_ys, batch_xs, sampled_timesteps)
             # Calculate masked MSE
-            loss = calc_masked_mse(pred_noise, noises, batch_masks)
+            loss = calc_mse(pred_noise, noises, batch_masks)
 
             opt.zero_grad()
             loss.backward()
@@ -243,7 +243,7 @@ def main():
     print(f"Device: {device}")
 
     scheduler = build_scheduler()
-    model_save_path = ROOT_PATH + "/Checkpoint/ImageRegression/Diffusers"
+    model_save_path = PROJ_PATH + "/Checkpoint/ImageRegression/Diffusers"
 
     # Train
     train_dataset = ImageRegressionDataset(sample_total_num=1000)

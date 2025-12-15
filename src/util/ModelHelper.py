@@ -141,121 +141,101 @@ def evaluate(true_ys: torch.Tensor, pred_ys: torch.Tensor, masks: torch.Tensor =
     if masks is not None and masks.dim() == 3:
         masks = masks.unsqueeze(1)
 
-    # Calculate MSE using calc_masked_mse if masks are provided, otherwise use standard MSE
-    if masks is not None:
-        mse = calc_masked_mse(pred_ys, true_ys, masks)
-    else:
-        # No mask: calculate standard MSE
-        mse = functional.mse_loss(pred_ys, true_ys)
-
+    mse = calc_mse(pred_ys, true_ys, masks)
+    bias = calc_bias(pred_ys, true_ys, masks)
     rmse = torch.sqrt(mse)
-
-    # Calculate R2 using calc_masked_r2 if masks are provided, otherwise calculate standard R2
-    if masks is not None:
-        r2 = calc_masked_r2(pred_ys, true_ys, masks)
-    else:
-        # No mask: calculate standard R2
-        true_ys_flat = true_ys.view(-1)
-        pred_ys_flat = pred_ys.view(-1)
-
-        ss_res = torch.sum((true_ys_flat - pred_ys_flat) ** 2)
-        ss_tot = torch.sum((true_ys_flat - torch.mean(true_ys_flat)) ** 2)
-
-        # Handle case where all true_ys are the same (ss_tot = 0)
-        if ss_tot < 1e-8:
-            if ss_res < 1e-8:
-                r2 = torch.tensor(1.0, device=true_ys.device)
-            else:
-                r2 = torch.tensor(float('inf'), device=true_ys.device)
-        else:
-            r2 = 1 - ss_res / ss_tot
+    ubrmse = torch.sqrt(torch.clamp(mse - bias ** 2, min=0.0))
+    r2 = calc_r2(pred_ys, true_ys, masks)
 
     print(f"Evaluation MSE: {mse.item():.6f}")
     print(f"Evaluation RMSE: {rmse.item():.6f}")
-    if torch.is_tensor(r2):
-        if torch.isnan(r2):
-            print(f"Evaluation R2: NaN")
-        elif torch.isinf(r2):
-            print(f"Evaluation R2: Inf")
-        else:
-            print(f"Evaluation R2: {r2.item():.6f}")
+    print(f"Evaluation ubRMSE: {ubrmse.item():.6f}")
+    print(f"Evaluation Bias: {bias.item():.6f}")
+    print(f"Evaluation R2: {r2.item():.6f}")
+
+
+def calc_mse(preds: torch.Tensor, targets: torch.Tensor, masks: torch.Tensor = None) -> torch.Tensor:
+    if masks is not None:
+        mse = (preds - targets) ** 2 * masks
+        mse = (mse.sum(dim=(1, 2, 3)) / torch.clamp(masks.sum(dim=(1, 2, 3)), min=1.0)).mean()
     else:
-        print(f"Evaluation R2: {r2:.6f}")
-
-
-def calc_masked_mse(preds: torch.Tensor, targets: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-    """
-    Calculate the masked mean squared error between predictions and targets.
-    Args:
-        preds (torch.Tensor): [B, C, H, W]
-        targets (torch.Tensor): [B, C, H, W]
-        masks (torch.Tensor): [B, 1, H, W]
-        C is the number of channels
-    Returns:
-        mse (torch.Tensor): scalar tensor representing the masked MSE
-    """
-    mse = (preds - targets) ** 2 * masks
-    mse = (mse.sum(dim=(1, 2, 3)) / torch.clamp(masks.sum(dim=(1, 2, 3)), min=1.0)).mean()
+        mse = functional.mse_loss(preds, targets)
 
     return mse
 
 
-def calc_masked_r2(preds: torch.Tensor, targets: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-    """
-    Calculate the masked R-squared (coefficient of determination) between predictions and targets.
-    Args:
-        preds (torch.Tensor): [B, C, H, W]
-        targets (torch.Tensor): [B, C, H, W]
-        masks (torch.Tensor): [B, 1, H, W], 1=valid, 0=invalid
-        C is the number of channels
-    Returns:
-        r2 (torch.Tensor): scalar tensor representing the masked R2 score
-    """
-    # Flatten tensors for easier computation
-    preds_flat = preds.view(preds.shape[0], -1)  # [B, C*H*W]
-    targets_flat = targets.view(targets.shape[0], -1)  # [B, C*H*W]
-    masks_flat = masks.view(masks.shape[0], -1)  # [B, H*W]
+def calc_bias(preds: torch.Tensor, targets: torch.Tensor, masks: torch.Tensor = None) -> torch.Tensor:
+    if masks is not None:
+        bias = (preds - targets) * masks
+        bias = (bias.sum(dim=(1, 2, 3)) / torch.clamp(masks.sum(dim=(1, 2, 3)), min=1.0)).mean()
+    else:
+        bias = torch.mean(preds - targets)
 
-    # Calculate R2 for each sample in the batch
-    r2_list = []
-    for b in range(preds.shape[0]):
-        # Get valid pixels for this sample
-        valid_mask = masks_flat[b] > 0  # [H*W]
+    return bias
 
-        if valid_mask.sum() == 0:
-            # No valid pixels, R2 is undefined
-            r2_list.append(torch.tensor(float('nan'), device=preds.device))
-            continue
 
-        pred_valid = preds_flat[b][valid_mask]  # [num_valid]
-        target_valid = targets_flat[b][valid_mask]  # [num_valid]
+def calc_r2(preds: torch.Tensor, targets: torch.Tensor, masks: torch.Tensor = None) -> torch.Tensor:
+    if masks is not None:
+        # Flatten tensors for easier computation
+        preds_flat = preds.view(preds.shape[0], -1)  # [B, C*H*W]
+        targets_flat = targets.view(targets.shape[0], -1)  # [B, C*H*W]
+        masks_flat = masks.view(masks.shape[0], -1)  # [B, H*W]
 
-        # Calculate SS_res (sum of squared residuals)
-        ss_res = torch.sum((target_valid - pred_valid) ** 2)
+        # Calculate R2 for each sample in the batch
+        r2_list = []
+        for b in range(preds.shape[0]):
+            # Get valid pixels for this sample
+            valid_mask = masks_flat[b] > 0  # [H*W]
 
-        # Calculate SS_tot (total sum of squares)
-        target_mean = torch.mean(target_valid)
-        ss_tot = torch.sum((target_valid - target_mean) ** 2)
+            if valid_mask.sum() == 0:
+                # No valid pixels, R2 is undefined
+                r2_list.append(torch.tensor(float('nan'), device=preds.device))
+                continue
 
-        # Handle case where all targets are the same (ss_tot = 0)
+            pred_valid = preds_flat[b][valid_mask]  # [num_valid]
+            target_valid = targets_flat[b][valid_mask]  # [num_valid]
+
+            # Calculate SS_res (sum of squared residuals)
+            ss_res = torch.sum((target_valid - pred_valid) ** 2)
+
+            # Calculate SS_tot (total sum of squares)
+            target_mean = torch.mean(target_valid)
+            ss_tot = torch.sum((target_valid - target_mean) ** 2)
+
+            # Handle case where all targets are the same (ss_tot = 0)
+            if ss_tot < 1e-8:
+                if ss_res < 1e-8:
+                    r2 = torch.tensor(1.0, device=preds.device)  # Perfect prediction when all values are the same
+                else:
+                    r2 = torch.tensor(float('inf'),
+                                      device=preds.device)  # Undefined: predictions differ but true values are constant
+            else:
+                r2 = 1 - ss_res / ss_tot
+
+            r2_list.append(r2)
+
+        # Return mean R2 across batch
+        r2_tensor = torch.stack(r2_list)
+        # Handle NaN values: if all are NaN, return NaN; otherwise return mean of non-NaN values
+        if torch.isnan(r2_tensor).all():
+            return torch.tensor(float('nan'), device=preds.device)
+        else:
+            return torch.nanmean(r2_tensor)
+    else:
+        # No mask: flatten and calculate R2 on all values
+        preds_flat = preds.view(-1)
+        targets_flat = targets.view(-1)
+
+        ss_res = torch.sum((targets_flat - preds_flat) ** 2)
+        ss_tot = torch.sum((targets_flat - torch.mean(targets_flat)) ** 2)
+
         if ss_tot < 1e-8:
             if ss_res < 1e-8:
-                r2 = torch.tensor(1.0, device=preds.device)  # Perfect prediction when all values are the same
+                return torch.tensor(1.0, device=targets.device)
             else:
-                r2 = torch.tensor(float('inf'),
-                                  device=preds.device)  # Undefined: predictions differ but true values are constant
+                return torch.tensor(float('inf'), device=targets.device)
         else:
-            r2 = 1 - ss_res / ss_tot
-
-        r2_list.append(r2)
-
-    # Return mean R2 across batch
-    r2_tensor = torch.stack(r2_list)
-    # Handle NaN values: if all are NaN, return NaN; otherwise return mean of non-NaN values
-    if torch.isnan(r2_tensor).all():
-        return torch.tensor(float('nan'), device=preds.device)
-    else:
-        return torch.nanmean(r2_tensor)
+            return 1 - ss_res / ss_tot
 
 
 class EarlyStopping:
