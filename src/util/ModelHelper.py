@@ -97,32 +97,28 @@ class PosEmbedding(nn.Module):
 
 
 class BaseResBlock(nn.Module):
-    def __init__(self, dim):
+
+    def __init__(self, hidden_dim: int):
         super().__init__()
+        self.hidden_dim = hidden_dim
         self.net = None
 
-    def forward(self, x):
+    def forward(self, x, *args):
         return x + self.net(x)
 
 
-class SimpleResBlock(nn.Module):
-    """
-    Simple Residual Block For 1D inputs
-    """
+class SimpleResBlock(BaseResBlock):
 
-    def __init__(self, dim):
-        super().__init__()
+    def __init__(self, hidden_dim: int):
+        super().__init__(hidden_dim)
         self.net = nn.Sequential(
-            nn.LayerNorm(dim),
+            nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.SiLU(),
-            nn.Linear(dim, dim),
+            nn.Linear(hidden_dim, hidden_dim),
         )
-
-    def forward(self, x):
-        return x + self.net(x)
 
 
 def evaluate(true_ys: torch.Tensor, pred_ys: torch.Tensor, masks: torch.Tensor = None):
