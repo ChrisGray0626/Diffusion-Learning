@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  @Description Diffusers.bak-Based Geographic Regression Task
-  基于扩散模型的地理回归任务：以记录为单位，经纬度直接作为自变量参与回归
+  @Description Diffusers-Based Soil Moisture Downscaling Trainer
   @Author Chris
   @Date 2025/11/12
 """
+from typing import List
+
 import torch
 import torch.nn as nn
 from diffusers import DDPMScheduler
@@ -14,8 +15,8 @@ from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from Constant import PROJ_PATH, RANGE
-from task.RSImageDownscale.Dataset import RSImageDownscaleDataset
-from task.RSImageDownscale.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
+from task.SMDownscale.Dataset import RSImageDownscaleDataset
+from task.SMDownscale.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
 from util.ModelHelper import SinusoidalPosEmb, EarlyStopping, evaluate
 
 # Dataset setting
@@ -223,7 +224,6 @@ class Trainer:
         return avg_loss
 
     def run(self):
-
         # Optimizer
         opt = torch.optim.Adam(self.model.parameters(), lr=self.lr)
         # Learning rate scheduler
@@ -279,7 +279,7 @@ def build_early_stopping() -> EarlyStopping:
 
 @torch.no_grad()
 def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
-                    xs: torch.Tensor, pos: torch.Tensor, dates: list,
+                    xs: torch.Tensor, pos: torch.Tensor, dates: List[str],
                     device: str, num_inference_steps: int = INFERENCE_STEPS) -> torch.Tensor:
     """
     基于记录的反向扩散过程
@@ -310,43 +310,27 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
     return ys
 
 
-def predict(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, device: str):
-    """
-    基于记录的预测函数
-    """
+def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, device: str):
     data_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)  # type: ignore[arg-type]
 
-    all_xs = []
-    all_pos = []
-    all_true_ys_normalized = []
-    all_date_strings = []
-
-    for xs, ys, pos, date_strs in data_loader:
-        all_xs.append(xs)
-        all_pos.append(pos)
-        all_true_ys_normalized.append(ys)
-        all_date_strings.extend(list(date_strs))
-
-    xs = torch.cat(all_xs, dim=0).to(device)
-    pos = torch.cat(all_pos, dim=0).to(device)
-    true_ys_normalized = torch.cat(all_true_ys_normalized, dim=0).to(device)
-    date_strings = all_date_strings
+    xs, true_ys, pos, dates = next(iter(data_loader))
+    xs = xs.to(device)
+    true_ys = true_ys.to(device)
+    pos = pos.to(device)
 
     with torch.no_grad():
-        pred_ys_normalized = reverse_diffuse(
-            model, scheduler, xs, pos, date_strings, device=device
+        pred_ys = reverse_diffuse(
+            model, scheduler, xs, pos, dates, device=device
         )
-        pred_ys_normalized = pred_ys_normalized.squeeze(1)  # [N, 1] -> [N]
 
-    # 反归一化
-    true_ys_np = true_ys_normalized.cpu().numpy()  # [N]
-    pred_ys_np = pred_ys_normalized.cpu().numpy()  # [N]
+    true_ys = true_ys.cpu().numpy()
+    pred_ys = pred_ys.cpu().numpy()
 
-    true_ys_denorm = dataset.dataset.denormalize_sm(true_ys_np)  # [N]
-    pred_ys_denorm = dataset.dataset.denormalize_sm(pred_ys_np)  # [N]
+    true_ys = dataset.dataset.denormalize_y(true_ys)
+    pred_ys = dataset.dataset.denormalize_y(pred_ys)
 
-    true_ys = torch.from_numpy(true_ys_denorm).to(device)  # [N]
-    pred_ys = torch.from_numpy(pred_ys_denorm).to(device)  # [N]
+    true_ys = torch.from_numpy(true_ys).to(device)
+    pred_ys = torch.from_numpy(pred_ys).to(device)
 
     return true_ys, pred_ys
 
@@ -360,27 +344,14 @@ def main():
     print(f"Device: {device}")
 
     scheduler = build_scheduler()
-    model_save_path = PROJ_PATH + "/Checkpoint/RSImageDownscale/Diffusers"
+    model_save_path = PROJ_PATH + "/Checkpoint/SMDownscale/Diffusers"
 
-    print("=" * 60)
-    print("Training on 36km data...")
-    print("=" * 60)
-
-    full_dataset = RSImageDownscaleDataset()
-
-    print(f"\n数据集信息:")
-    print(f"  - 总记录数: {len(full_dataset)}")
-    if hasattr(full_dataset, 'sm_mean') and hasattr(full_dataset, 'sm_std'):
-        print(f"  - SM归一化参数: mean={full_dataset.sm_mean:.4f}, std={full_dataset.sm_std:.4f}")
-    print(f"  - 模型配置: hidden_dim={HIDDEN_DIM}, timestep_emb_dim={TIMESTEP_EMB_DIM}")
-    print(f"  - 扩散步数: {STEP_TOTAL_NUM} (训练), {INFERENCE_STEPS} (推理)")
-    print()
-
-    train_size = int(0.8 * len(full_dataset))
-    val_size = int(0.1 * len(full_dataset))
-    test_size = len(full_dataset) - train_size - val_size
+    dataset = RSImageDownscaleDataset()
+    train_size = int(0.8 * len(dataset))
+    val_size = int(0.1 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
     train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        full_dataset, [train_size, val_size, test_size],
+        dataset, [train_size, val_size, test_size],
         generator=torch.Generator().manual_seed(42)
     )
 
@@ -392,21 +363,23 @@ def main():
         num_res_blocks=3,
     ).to(device)
 
-    early_stopping = build_early_stopping()
-    trainer = Trainer(model, scheduler, train_dataset, val_dataset, device=device, early_stopping=early_stopping,
-                      total_epoch=TOTAL_EPOCH, batch_size=BATCH_SIZE, lr=LR)
-    model = trainer.run()
-    model.save_pretrained(model_save_path)
+    # # Training Phase
+    # print("\n" + "=" * 60)
+    # print(f"Training ...")
+    # print("=" * 60)
+    # early_stopping = build_early_stopping()
+    # trainer = Trainer(model, scheduler, train_dataset, val_dataset, device=device, early_stopping=early_stopping,
+    #                   total_epoch=TOTAL_EPOCH, batch_size=BATCH_SIZE, lr=LR)
+    # model = trainer.run()
+    # model.save_pretrained(model_save_path)
 
-    # Predict
+    # Testing Phase
     model = NoisePredictor.from_pretrained(model_save_path).to(device)
     print("\n" + "=" * 60)
-    print(f"Predicting ...")
+    print(f"Testing ...")
     print("=" * 60)
-    true_ys, pred_ys = predict(model, scheduler, test_dataset, device)
+    true_ys, pred_ys = test(model, scheduler, test_dataset, device)
 
-    # Evaluate (所有记录都是有效的，不需要mask)
-    # evaluate函数可以处理展平的张量
     true_ys = true_ys.view(-1, 1)  # [N] -> [N, 1]
     pred_ys = pred_ys.view(-1, 1)  # [N] -> [N, 1]
     evaluate(true_ys, pred_ys)

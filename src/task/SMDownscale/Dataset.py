@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  @Description Remote Sensing Image Downscaling Dataset
+  @Description Dataset for Task
   @Author Chris
   @Date 2025/11/12
 """
@@ -78,7 +78,6 @@ class RSImageDownscaleDataset(Dataset):
 
         return xs, ys
 
-
     def _filter_valid(self):
         valid = ~np.isnan(self.xs).any(axis=1) & ~np.isnan(self.ys).any(axis=1)
 
@@ -96,18 +95,16 @@ class RSImageDownscaleDataset(Dataset):
             if std_val > 0:
                 self.xs[:, i] = (self.xs[:, i] - mean_val) / std_val
 
-        self.sm_mean = self.ys.mean()
-        self.sm_std = self.ys.std()
-        if self.sm_std > 0:
-            self.ys = (self.ys - self.sm_mean) / self.sm_std
+        self.y_mean = self.ys.mean()
+        self.y_std = self.ys.std()
+        if self.y_std > 0:
+            self.ys = (self.ys - self.y_mean) / self.y_std
         else:
-            self.sm_mean = 0.0
-            self.sm_std = 1.0
+            self.y_mean = 0.0
+            self.y_std = 1.0
 
-    def denormalize_sm(self, sm_normalized):
-        if not hasattr(self, 'sm_mean') or not hasattr(self, 'sm_std'):
-            return sm_normalized
-        return sm_normalized * self.sm_std + self.sm_mean
+    def denormalize_y(self, ys):
+        return ys * self.y_std + self.y_mean
 
     def __len__(self):
         return len(self.xs)
@@ -119,3 +116,5 @@ class RSImageDownscaleDataset(Dataset):
         date = str(self.dates[idx])
 
         return xs, ys, pos, date
+
+# TODO 1km Dataset for Prediction

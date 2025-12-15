@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-  @Description Custom modules for RSImageDownscale task
+  @Description Module for Task
   @Author Chris
   @Date 2025/11/12
 """
