@@ -15,28 +15,28 @@ from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from Constant import PROJ_PATH, RANGE
-from task.SMDownscale.Dataset import RSImageDownscaleDataset
+from task.SMDownscale.Dataset import TrainDataset
 from task.SMDownscale.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
 from util.ModelHelper import SinusoidalPosEmb, EarlyStopping, evaluate
 
 # Dataset setting
-INPUT_FEATURE_NUM = 5  # NDVI, LST, Albedo, Precipitation, DEM (输入特征数量)
-POS_FEATURE_NUM = 2  # Latitude, Longitude (经纬度特征数量，直接作为自变量)
+INPUT_FEATURE_NUM = 5
 
 # Diffusion setting
-STEP_TOTAL_NUM = 1000  # 增加扩散步数，更细粒度的噪声调度
+STEP_TOTAL_NUM = 1000
 BETA_START = 1e-4
 BETA_END = 0.02
 
 # Model setting
-HIDDEN_DIM = 512  # 增加模型容量，从256增加到512
+HIDDEN_DIM = 512
 TIMESTEP_EMB_DIM = 128
 
 # Inference setting
-INFERENCE_STEPS = 50  # 推理时使用更少的步数（加速采样）
+# Less inference steps for faster sampling
+INFERENCE_STEP_NUM = 50
 
 # Train setting
-TOTAL_EPOCH = 50
+TOTAL_EPOCH = 60
 BATCH_SIZE = 64
 LR = 2e-4
 
@@ -48,18 +48,17 @@ MIN_DELTA = 1e-6
 class NoisePredictor(ModelMixin, ConfigMixin):
 
     @register_to_config
-    def __init__(self, input_feature_num: int = 5, pos_feature_num: int = 2,
+    def __init__(self, input_feature_num: int,
                  hidden_dim: int = 512, timestep_emb_dim: int = 128,
-                 num_res_blocks: int = 3):
+                 res_block_num: int = 3):
         super().__init__()
         self.input_feature_num = input_feature_num
         self.hidden_dim = hidden_dim
 
-        # 输入特征层（不包含位置，位置单独嵌入）
         input_dim = input_feature_num + 1
         self.input_layer = nn.Linear(input_dim, hidden_dim)
 
-        # 扩散时间步嵌入
+        # Timestep Embedding
         self.timestep_embedding = nn.Sequential(
             SinusoidalPosEmb(timestep_emb_dim),
             nn.Linear(timestep_emb_dim, timestep_emb_dim * 4),
@@ -68,13 +67,13 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         )
         self.emb_timestep2hidden = nn.Linear(timestep_emb_dim * 4, hidden_dim)
 
-        # 时间嵌入（DOY + 年份 + 多频率 Fourier）
+        # Time Embedding
         self.time_embedding = TimeEmbedding(
             hidden_dim=hidden_dim,
             num_fourier=8
         )
 
-        # 空间嵌入（确定性指数频率，分别处理经度和纬度）
+        # Spatial Embedding
         lon_min, lat_min, lon_max, lat_max = RANGE
         self.spatial_embedding = SpatialEmbedding(
             hidden_dim=hidden_dim,
@@ -85,19 +84,20 @@ class NoisePredictor(ModelMixin, ConfigMixin):
             lat_max=lat_max
         )
 
-        # 条件信息融合层（融合时间步、时间、空间嵌入）
+        # Condition Fusion
         self.condition_fusion = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim * 2),
             nn.SiLU(),
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
 
+        # Residual Block
         self.res_blocks = nn.ModuleList([
             FiLMResBlock(hidden_dim=hidden_dim)
-            for _ in range(num_res_blocks)
+            for _ in range(res_block_num)
         ])
 
-        # 输出层
+        # Output Layer
         self.output_layer = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
@@ -108,24 +108,24 @@ class NoisePredictor(ModelMixin, ConfigMixin):
 
     def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
                 pos: torch.Tensor, dates: List[str]) -> torch.Tensor:
-        # 输入特征（不包含位置）
         inputs = torch.cat([xs, diffused_ys], dim=1)
         x = self.input_layer(inputs)
 
-        # 时间步嵌入
+        # Embed Timestep
         embed_timesteps = self.timestep_embedding(timesteps)
         embed_timesteps = self.emb_timestep2hidden(embed_timesteps)
 
-        # 时间嵌入（从日期字符串提取特征）
+        # Embed Time
         embed_time = self.time_embedding(dates)
 
-        # 空间嵌入
+        # Embed Spatial
         embed_spatial = self.spatial_embedding(pos)
 
-        # 融合条件信息（时间步 + 时间 + 空间）
+        # Fuse Condition
         condition = torch.cat([embed_timesteps, embed_time, embed_spatial], dim=1)
         condition = self.condition_fusion(condition)
 
+        # Residual Blocks with FiLM
         for res_block in self.res_blocks:
             x = res_block(x, condition)
 
@@ -181,9 +181,7 @@ class Trainer:
                 diffused_ys, batch_xs, sampled_timesteps,
                 pos=batch_pos, dates=batch_dates
             )
-            # pred_noise: [B, 1], noises: [B, 1]
 
-            # Calculate MSE loss (不再需要mask，所有记录都是有效的)
             loss = nn.functional.mse_loss(pred_noise, noises)
             total_loss += loss.item() * B
             total_samples += B
@@ -255,26 +253,12 @@ def build_early_stopping() -> EarlyStopping:
 @torch.no_grad()
 def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
                     xs: torch.Tensor, pos: torch.Tensor, dates: List[str],
-                    device: str, num_inference_steps: int = INFERENCE_STEPS) -> torch.Tensor:
-    """
-    基于记录的反向扩散过程
-
-    Args:
-        model: 噪声预测模型
-        scheduler: 扩散调度器
-        xs: [B, input_feature_num] - 输入特征
-        pos: [B, pos_feature_num] - 标准化后的坐标
-        dates: List[str] - 日期字符串列表
-        device: 设备
-        num_inference_steps: 推理步数
-    Returns:
-        [B, 1] - 预测的输出
-    """
+                    inference_step_num: int, device: str) -> torch.Tensor:
     model.eval()
     B = xs.shape[0]
 
     ys = torch.randn(B, 1, device=device)
-    scheduler.set_timesteps(num_inference_steps)
+    scheduler.set_timesteps(inference_step_num)
 
     for timestep in scheduler.timesteps:
         timesteps = torch.full((B,), timestep.item(), device=device, dtype=torch.long)
@@ -295,7 +279,7 @@ def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, devi
 
     with torch.no_grad():
         pred_ys = reverse_diffuse(
-            model, scheduler, xs, pos, dates, device=device
+            model, scheduler, xs, pos, dates, INFERENCE_STEP_NUM, device=device
         )
 
     true_ys = true_ys.cpu().numpy()
@@ -321,7 +305,7 @@ def main():
     scheduler = build_scheduler()
     model_save_path = PROJ_PATH + "/Checkpoint/SMDownscale/Diffusers"
 
-    dataset = RSImageDownscaleDataset()
+    dataset = TrainDataset()
     train_size = int(0.8 * len(dataset))
     val_size = int(0.1 * len(dataset))
     test_size = len(dataset) - train_size - val_size
@@ -332,21 +316,20 @@ def main():
 
     model = NoisePredictor(
         input_feature_num=INPUT_FEATURE_NUM,
-        pos_feature_num=POS_FEATURE_NUM,
         hidden_dim=HIDDEN_DIM,
         timestep_emb_dim=TIMESTEP_EMB_DIM,
-        num_res_blocks=3,
+        res_block_num=3,
     ).to(device)
 
-    # # Training Phase
-    # print("\n" + "=" * 60)
-    # print(f"Training ...")
-    # print("=" * 60)
-    # early_stopping = build_early_stopping()
-    # trainer = Trainer(model, scheduler, train_dataset, val_dataset, device=device, early_stopping=early_stopping,
-    #                   total_epoch=TOTAL_EPOCH, batch_size=BATCH_SIZE, lr=LR)
-    # model = trainer.run()
-    # model.save_pretrained(model_save_path)
+    # Training Phase
+    print("\n" + "=" * 60)
+    print(f"Training ...")
+    print("=" * 60)
+    early_stopping = build_early_stopping()
+    trainer = Trainer(model, scheduler, train_dataset, val_dataset, device=device, early_stopping=early_stopping,
+                      total_epoch=TOTAL_EPOCH, batch_size=BATCH_SIZE, lr=LR)
+    model = trainer.run()
+    model.save_pretrained(model_save_path)
 
     # Testing Phase
     model = NoisePredictor.from_pretrained(model_save_path).to(device)
