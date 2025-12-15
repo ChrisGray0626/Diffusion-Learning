@@ -58,13 +58,13 @@ class ChannelAttention(nn.Module):
 
 class ResBlock(BaseResBlock):
 
-    def __init__(self, dim):
-        super().__init__(dim)
+    def __init__(self, hidden_dim):
+        super().__init__(hidden_dim)
         self.net = nn.Sequential(
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-            nn.GroupNorm(8, dim),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(8, hidden_dim),
             nn.SiLU(),
-            nn.Conv2d(dim, dim, kernel_size=3, padding=1),
-            nn.GroupNorm(8, dim),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+            nn.GroupNorm(8, hidden_dim),
             nn.SiLU(),
         )

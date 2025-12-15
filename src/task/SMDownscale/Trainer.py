@@ -51,16 +51,6 @@ class NoisePredictor(ModelMixin, ConfigMixin):
     def __init__(self, input_feature_num: int = 5, pos_feature_num: int = 2,
                  hidden_dim: int = 512, timestep_emb_dim: int = 128,
                  num_res_blocks: int = 3):
-        """
-        基于记录的地理回归模型（集成时间嵌入、空间嵌入和FiLM+ResBlock）
-
-        Args:
-            input_feature_num: 输入特征数量（如NDVI, LST等，通常为5）
-            pos_feature_num: 位置特征数量（经纬度，通常为2）
-            hidden_dim: 隐藏层维度
-            timestep_emb_dim: 时间步嵌入维度
-            num_res_blocks: ResBlock 层数
-        """
         super().__init__()
         self.input_feature_num = input_feature_num
         self.hidden_dim = hidden_dim
@@ -102,7 +92,6 @@ class NoisePredictor(ModelMixin, ConfigMixin):
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
 
-        # FiLM + ResBlock 层
         self.res_blocks = nn.ModuleList([
             FiLMResBlock(hidden_dim=hidden_dim)
             for _ in range(num_res_blocks)
@@ -118,19 +107,7 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         )
 
     def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
-                pos: torch.Tensor, dates: list) -> torch.Tensor:
-        """
-        基于记录的地理回归前向传播（集成时间嵌入、空间嵌入和FiLM+ResBlock）
-
-        Args:
-            diffused_ys: [B, 1] - 扩散后的输出
-            xs: [B, input_feature_num] - 输入特征
-            timesteps: [B] - 扩散时间步
-            pos: [B, pos_feature_num] - 原始坐标 [lon, lat]
-            dates: List[str] - 日期字符串列表，格式为 'YYYYMMDD'
-        Returns:
-            [B, 1] - 预测的噪声
-        """
+                pos: torch.Tensor, dates: List[str]) -> torch.Tensor:
         # 输入特征（不包含位置）
         inputs = torch.cat([xs, diffused_ys], dim=1)
         x = self.input_layer(inputs)
@@ -149,11 +126,9 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         condition = torch.cat([embed_timesteps, embed_time, embed_spatial], dim=1)
         condition = self.condition_fusion(condition)
 
-        # 通过多个 FiLM + ResBlock 层
         for res_block in self.res_blocks:
             x = res_block(x, condition)
 
-        # 输出层
         out = self.output_layer(x)
 
         return out
