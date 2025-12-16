@@ -12,7 +12,7 @@ PROJ_PATH = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR_PATH = "/Volumes/Elements SE/Data/Downscale-DM"
 RAW_DIR_PATH: str = os.path.join(DATA_DIR_PATH, "Raw/2016-2020")
 PROCESSED_DIR_PATH = os.path.join(DATA_DIR_PATH, "Processed")
-RESULT_PATH: str = os.path.join(PROJ_PATH, "Result")
+INFERENCE_DIR_PATH = os.path.join(DATA_DIR_PATH, "Inference")
 
 VALID_DATE_FILE_PATH = os.path.join(DATA_DIR_PATH, "ValidDate.txt")
 
@@ -34,8 +34,8 @@ DEM_NAME = "DEM"
 RESOLUTION_36KM = "36km"
 RESOLUTION_1KM = "1km"
 
-STANDARD_GRID_36KM_PATH = os.path.join(DATA_DIR_PATH, "Standard_Grid_36km.tif")
-STANDARD_GRID_1KM_PATH = os.path.join(DATA_DIR_PATH, "Standard_Grid_1km.tif")
+REF_GRID_36KM_PATH = os.path.join(DATA_DIR_PATH, "Standard_Grid_36km.tif")
+REF_GRID_1KM_PATH = os.path.join(DATA_DIR_PATH, "Standard_Grid_1km.tif")
 
 X_COLUMN = [
     NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME
