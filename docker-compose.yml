@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  downscale-sm:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: downscale-sm:latest
+    container_name: downscale-sm
+    environment:
+      - DATA_DIR_PATH=/Data
+    volumes:
+      - ./src:/App
+      - ./Checkpoint:/App/Checkpoint
+      - /Volumes/Elements SE/Data/Downscale-DM:/Data
+    working_dir: /App
+    # 执行推理脚本
+    command: python task/SMDownscale/Inferencer.py

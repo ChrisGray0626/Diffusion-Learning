@@ -1,3 +1,9 @@
+affine==2.4.0
 diffusers==0.35.2
-numpy==2.3.4
+matplotlib==3.10.8
+numpy==2.3.5
+pyproj==3.7.2
+rasterio==1.4.3
 torch==2.9.0
+tqdm==4.67.1
+accelerate

@@ -15,13 +15,13 @@ from Constant import *
 from task.SMDownscale.Dataset import InferenceDataset, TrainDataset
 from task.SMDownscale.Trainer import NoisePredictor, build_scheduler, reverse_diffuse
 from util.TiffUtil import write_tiff, read_tiff_meta
-from util.Util import get_valid_dates
+from util.Util import get_valid_dates, build_device
 
 # Inference settings
 INFERENCE_STEP_NUM = 50
 BATCH_SIZE = 8192
 
-RESOLUTION = RESOLUTION_36KM
+RESOLUTION = RESOLUTION_1KM
 if RESOLUTION == RESOLUTION_1KM:
     REF_GRID_PATH = REF_GRID_1KM_PATH
 else:
@@ -56,16 +56,6 @@ def main():
         os.makedirs(dst_dir_path, exist_ok=True)
         dst_file_path = os.path.join(dst_dir_path, f"{date}{TIFF_SUFFIX}")
         write_tiff(pred_map, dst_file_path, transform=transform, crs=crs)
-
-
-def build_device() -> str:
-    device = "cpu"
-    if torch.cuda.is_available():
-        device = "cuda"
-    elif hasattr(torch.backends, "mps") and torch.mps.is_available():
-        device = "mps"
-
-    return device
 
 
 def build_model() -> NoisePredictor:
