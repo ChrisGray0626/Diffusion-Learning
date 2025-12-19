@@ -11,9 +11,8 @@ services:
     environment:
       - DATA_DIR_PATH=/Data
     volumes:
-      - ./src:/App
+      - ./Src:/App/Src
       - ./Checkpoint:/App/Checkpoint
       - /Volumes/Elements SE/Data/Downscale-DM:/Data
     working_dir: /App
-    # 执行推理脚本
-    command: python task/SMDownscale/Inferencer.py
+    command: python Src/Task/DownscaleSM/Inferencer.py

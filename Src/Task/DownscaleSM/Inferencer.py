@@ -12,14 +12,14 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from Constant import *
-from task.SMDownscale.Dataset import InferenceDataset, TrainDataset
-from task.SMDownscale.Trainer import NoisePredictor, build_scheduler, reverse_diffuse
-from util.TiffUtil import write_tiff, read_tiff_meta
-from util.Util import get_valid_dates, build_device
+from Task.DownscaleSM.Dataset import InferenceDataset, TrainDataset
+from Task.DownscaleSM.Trainer import NoisePredictor, build_scheduler, reverse_diffuse
+from Util.TiffUtil import write_tiff, read_tiff_meta
+from Util.Util import get_valid_dates, build_device
 
 # Inference settings
 INFERENCE_STEP_NUM = 50
-BATCH_SIZE = 8192
+BATCH_SIZE = 16384
 
 RESOLUTION = RESOLUTION_1KM
 if RESOLUTION == RESOLUTION_1KM:
@@ -29,6 +29,8 @@ else:
 
 
 def main():
+    print(f"Device: {build_device()}")
+
     train_dataset = TrainDataset()
     denorm_fn = train_dataset.denormalize_y
     x_mean = torch.from_numpy(train_dataset.x_mean).float()
@@ -59,7 +61,7 @@ def main():
 
 
 def build_model() -> NoisePredictor:
-    model_save_path = os.path.join(PROJ_PATH, "Checkpoint/SMDownscale/Diffusers")
+    model_save_path = os.path.join(CHECKPOINT_DIR_PATH, "DownscaleSM/Diffusers")
     model = NoisePredictor.from_pretrained(model_save_path)
 
     return model
@@ -86,6 +88,7 @@ def inference(dataset: Dataset, height: int, width: int, norm_fn, denorm_fn) -> 
         )
         batch_pred_ys = batch_pred_ys.cpu().numpy()
         batch_pred_ys = denorm_fn(batch_pred_ys).reshape(-1)
+        # TODO 裁剪范围 0.02 0.5?
 
         pred_ys.append(batch_pred_ys)
         grid_indices.append(batch_grid_indices)

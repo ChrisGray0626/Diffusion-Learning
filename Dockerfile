@@ -7,17 +7,12 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements-docker.txt && \
     rm requirements-docker.txt
 
-#RUN apt-get update && apt-get install -y \
-#    libgdal-dev \
-#    && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /App
 
-ENV PYTHONUNBUFFERED=1 \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PROJ_PATH=/App \
-    DATA_DIR_PATH=/Data
-
-ENV PYTHONPATH=/App
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PROJ_PATH=/App
+ENV PYTHONPATH=/App/src
+ENV DATA_DIR_PATH=Data
 
 CMD ["bash"]

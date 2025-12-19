@@ -15,9 +15,9 @@ from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from Constant import PROJ_PATH, RANGE
-from task.SMDownscale.Dataset import TrainDataset
-from task.SMDownscale.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
-from util.ModelHelper import SinusoidalPosEmb, EarlyStopping, evaluate
+from Task.DownscaleSM.Dataset import TrainDataset
+from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
+from Util.ModelHelper import SinusoidalPosEmb, EarlyStopping, evaluate
 
 # Dataset setting
 INPUT_FEATURE_NUM = 5
@@ -85,6 +85,7 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         )
 
         # Condition Fusion
+        # TODO in-situ 数据参与引导
         self.condition_fusion = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim * 2),
             nn.SiLU(),
@@ -303,7 +304,7 @@ def main():
     print(f"Device: {device}")
 
     scheduler = build_scheduler()
-    model_save_path = PROJ_PATH + "/Checkpoint/SMDownscale/Diffusers"
+    model_save_path = PROJ_PATH + "/Checkpoint/DownscaleSM/Diffusers"
 
     dataset = TrainDataset()
     train_size = int(0.8 * len(dataset))

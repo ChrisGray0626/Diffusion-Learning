@@ -8,7 +8,7 @@
 import torch
 from torch import nn
 
-from util.ModelHelper import BaseResBlock
+from Util.ModelHelper import BaseResBlock
 
 
 class ChannelAttention(nn.Module):

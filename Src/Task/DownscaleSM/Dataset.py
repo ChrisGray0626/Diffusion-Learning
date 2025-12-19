@@ -15,8 +15,8 @@ from torch.utils.data import Dataset
 from Constant import DEM_NAME, RESOLUTION_36KM, RESOLUTION_1KM, TIFF_SUFFIX, REF_GRID_36KM_PATH, \
     REF_GRID_1KM_PATH, \
     NDVI_NAME, PRECIPITATION_NAME, ALBEDO_NAME, LST_NAME, SM_NAME, PROCESSED_DIR_PATH
-from util.TiffUtil import read_tiff, read_tiff_data
-from util.Util import get_valid_dates
+from Util.TiffUtil import read_tiff, read_tiff_data
+from Util.Util import get_valid_dates
 
 
 class TrainDataset(Dataset):
@@ -84,6 +84,7 @@ class TrainDataset(Dataset):
         self.x_mean = self.xs.mean(axis=0).astype(np.float32)
         self.x_std = self.xs.std(axis=0).astype(np.float32)
         self.x_std[self.x_std == 0] = 1.0
+        # TODO 归一化后的数据范围检查
         self.xs = (self.xs - self.x_mean) * (1.0 / self.x_std)
 
         self.y_mean = self.ys.mean()

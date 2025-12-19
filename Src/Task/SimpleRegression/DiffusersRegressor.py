@@ -16,7 +16,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from Constant import PROJ_PATH
-from util.ModelHelper import SinusoidalPosEmb, SimpleResBlock, evaluate
+from Util.ModelHelper import SinusoidalPosEmb, SimpleResBlock, evaluate
 
 # Dataset setting
 X_DIM = 5

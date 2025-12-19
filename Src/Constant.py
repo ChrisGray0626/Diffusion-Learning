@@ -9,6 +9,7 @@ import os
 
 # 基础路径
 PROJ_PATH = os.getenv("PROJ_PATH") or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CHECKPOINT_DIR_PATH = os.path.join(PROJ_PATH, "Checkpoint")
 DATA_DIR_PATH = os.getenv("DATA_DIR_PATH", "/Volumes/Elements SE/Data/Downscale-DM")
 RAW_DIR_PATH: str = os.path.join(DATA_DIR_PATH, "Raw/2016-2020")
 PROCESSED_DIR_PATH = os.path.join(DATA_DIR_PATH, "Processed")
