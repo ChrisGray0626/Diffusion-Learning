@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 
 from Constant import DEM_NAME, RESOLUTION_36KM, RESOLUTION_1KM, TIFF_SUFFIX, REF_GRID_36KM_PATH, \
     REF_GRID_1KM_PATH, \
-    NDVI_NAME, PRECIPITATION_NAME, ALBEDO_NAME, LST_NAME, SM_NAME, PROCESSED_DIR_PATH
+    NDVI_NAME, PRECIPITATION_NAME, ALBEDO_NAME, LST_NAME, SM_NAME, PROCESSED_DIR_PATH, IN_SITU_NAME
 from Util.TiffUtil import read_tiff, read_tiff_data
 from Util.Util import get_valid_dates
 
@@ -67,9 +67,35 @@ class TrainDataset(Dataset):
         pos_expanded = np.tile(pos_grid[np.newaxis, :, :, :], (date_num, 1, 1, 1))
         self.pos = pos_expanded.reshape(date_num * H * W, -1).astype(np.float32)
 
-        # Reshape date data
+        # Load InSitu data
+        insitu_list = []
+        insitu_stats_list = []
+
+        for date in dates:
+            insitu_path = os.path.join(PROCESSED_DIR_PATH, IN_SITU_NAME, RESOLUTION_36KM, f'{date}{TIFF_SUFFIX}')
+            insitu_data = read_tiff_data(insitu_path).astype(np.float32)
+            insitu_list.append(insitu_data)
+
+            valid_insitu = insitu_data[~np.isnan(insitu_data)]
+            if len(valid_insitu) > 0:
+                raw_stats = np.array([
+                    np.mean(valid_insitu),
+                    np.std(valid_insitu),
+                    np.percentile(valid_insitu, 25),
+                    np.percentile(valid_insitu, 75),
+                ], dtype=np.float32)
+            else:
+                raw_stats = np.zeros(4, dtype=np.float32)
+            insitu_stats_list.append(raw_stats)
+
+        self.insitu_stats = np.array(insitu_stats_list, dtype=np.float32)
+        insitus = np.array(insitu_list, dtype=np.float32)
+        self.insitus = insitus.reshape(date_num * H * W, -1).astype(np.float32)
+        self.insitu_masks = (~np.isnan(self.insitus)).astype(np.float32)
+
         dates = np.repeat(dates, H * W)
         self.dates = np.array(dates, dtype=object)
+        self.date_indices = np.repeat(np.arange(date_num), H * W).astype(np.int32)
 
     def _filter_valid(self):
         valid = ~np.isnan(self.xs).any(axis=1) & ~np.isnan(self.ys).any(axis=1)
@@ -78,22 +104,32 @@ class TrainDataset(Dataset):
         self.pos = self.pos[valid]
         self.ys = self.ys[valid, 0]
         self.dates = self.dates[valid]
+        self.insitus = self.insitus[valid, 0]
+        self.insitu_masks = self.insitu_masks[valid, 0]
+        self.date_indices = self.date_indices[valid]
 
     def _normalize_feat(self):
-        # feature normalization using training set statistics
-        self.x_mean = self.xs.mean(axis=0).astype(np.float32)
-        self.x_std = self.xs.std(axis=0).astype(np.float32)
-        self.x_std[self.x_std == 0] = 1.0
-        # TODO 归一化后的数据范围检查
-        self.xs = (self.xs - self.x_mean) * (1.0 / self.x_std)
+        x_mean = self.xs.mean(axis=0).astype(np.float32)
+        x_std = self.xs.std(axis=0).astype(np.float32)
+        x_std[x_std == 0] = 1.0
+        self.xs = (self.xs - x_mean) * (1.0 / x_std)
 
         self.y_mean = self.ys.mean()
         self.y_std = self.ys.std()
-        if self.y_std > 0:
-            self.ys = (self.ys - self.y_mean) / self.y_std
-        else:
-            self.y_mean = 0.0
-            self.y_std = 1.0
+        self.ys = (self.ys - self.y_mean) / self.y_std
+
+        self.insitus = np.where(
+            self.insitu_masks > 0,
+            (self.insitus - self.y_mean) / self.y_std,
+            0.0
+        ).astype(np.float32)
+        self.insitu_stats = (self.insitu_stats - self.y_mean) / self.y_std
+
+        # Normalize InSitu stats
+        stats_mean = self.insitu_stats.mean(axis=0)
+        stats_std = self.insitu_stats.std(axis=0)
+        stats_std[stats_std == 0] = 1.0
+        self.insitu_stats = (self.insitu_stats - stats_mean) / stats_std
 
     def denormalize_y(self, ys):
         return ys * self.y_std + self.y_mean
@@ -106,8 +142,13 @@ class TrainDataset(Dataset):
         ys = torch.tensor(self.ys[idx], dtype=torch.float32)
         pos = torch.from_numpy(self.pos[idx]).float()
         date = str(self.dates[idx])
+        insitus = torch.tensor(self.insitus[idx], dtype=torch.float32)
+        insitu_masks = torch.tensor(self.insitu_masks[idx], dtype=torch.float32)
 
-        return xs, ys, pos, date
+        date_idx = self.date_indices[idx]
+        insitu_stats = torch.from_numpy(self.insitu_stats[date_idx]).float()
+
+        return xs, ys, pos, date, insitus, insitu_masks, insitu_stats
 
 
 class InferenceDataset(Dataset):

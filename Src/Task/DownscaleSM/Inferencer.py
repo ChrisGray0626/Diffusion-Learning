@@ -21,6 +21,10 @@ from Util.Util import get_valid_dates, build_device
 INFERENCE_STEP_NUM = 50
 BATCH_SIZE = 16384
 
+# Valid range for soil moisture
+SM_MIN = 0.02
+SM_MAX = 0.5
+
 RESOLUTION = RESOLUTION_1KM
 if RESOLUTION == RESOLUTION_1KM:
     REF_GRID_PATH = REF_GRID_1KM_PATH
@@ -32,12 +36,16 @@ def main():
     print(f"Device: {build_device()}")
 
     train_dataset = TrainDataset()
-    denorm_fn = train_dataset.denormalize_y
     x_mean = torch.from_numpy(train_dataset.x_mean).float()
     x_std = torch.from_numpy(train_dataset.x_std).float()
+    y_mean = torch.tensor(train_dataset.y_mean, dtype=torch.float32)
+    y_std = torch.tensor(train_dataset.y_std, dtype=torch.float32)
 
     def norm_fn(x: torch.Tensor) -> torch.Tensor:
         return (x - x_mean.to(x.device)) / x_std.to(x.device)
+
+    def denorm_fn(y: torch.Tensor, device: torch.device) -> torch.Tensor:
+        return y * y_std.to(device) + y_mean.to(device)
 
     transform, crs, height, width = read_tiff_meta(REF_GRID_PATH)
     dates = get_valid_dates()
@@ -86,9 +94,12 @@ def inference(dataset: Dataset, height: int, width: int, norm_fn, denorm_fn) -> 
         batch_pred_ys = reverse_diffuse(
             model, scheduler, batch_xs, batch_pos, batch_dates, INFERENCE_STEP_NUM, device=device
         )
+        batch_pred_ys = batch_pred_ys.reshape(-1)
+        # Denormalize
+        batch_pred_ys = denorm_fn(batch_pred_ys, device)
+        # Clip
+        batch_pred_ys = torch.clamp(batch_pred_ys, SM_MIN, SM_MAX)
         batch_pred_ys = batch_pred_ys.cpu().numpy()
-        batch_pred_ys = denorm_fn(batch_pred_ys).reshape(-1)
-        # TODO 裁剪范围 0.02 0.5?
 
         pred_ys.append(batch_pred_ys)
         grid_indices.append(batch_grid_indices)

@@ -31,6 +31,7 @@ SM_NAME = "SM"
 ALBEDO_NAME = "Albedo"
 PRECIPITATION_NAME = "Precipitation"
 DEM_NAME = "DEM"
+IN_SITU_NAME = "InSitu"
 
 RESOLUTION_36KM = "36km"
 RESOLUTION_1KM = "1km"

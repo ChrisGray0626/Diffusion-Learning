@@ -5,6 +5,7 @@
   @Author Chris
   @Date 2025/11/12
 """
+import os
 from typing import List
 
 import torch
@@ -14,10 +15,11 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from Constant import PROJ_PATH, RANGE
+from Constant import RANGE, CHECKPOINT_DIR_PATH
 from Task.DownscaleSM.Dataset import TrainDataset
 from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
 from Util.ModelHelper import SinusoidalPosEmb, EarlyStopping, evaluate
+from Util.Util import build_device
 
 # Dataset setting
 INPUT_FEATURE_NUM = 5
@@ -43,6 +45,59 @@ LR = 2e-4
 # Early stopping setting
 PATIENCE = 5
 MIN_DELTA = 1e-6
+
+# InSitu consistency loss setting
+CONSISTENCY_LOSS_WEIGHT = 0.3
+BIAS_LOSS_WEIGHT = 3.0
+VAR_LOSS_WEIGHT = 0.5
+MIN_TIMESTEP_FOR_CONSISTENCY = 10
+
+
+def main():
+    device = build_device()
+    scheduler = build_scheduler()
+    model_save_path = os.path.join(CHECKPOINT_DIR_PATH, "DownscaleSM", "Diffusers")
+
+    dataset = TrainDataset()
+    train_size = int(0.8 * len(dataset))
+    val_size = int(0.1 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size, test_size],
+        generator=torch.Generator().manual_seed(42)
+    )
+
+    is_training = True
+    is_test = True
+    # Training Phase
+    if is_training:
+        print("\n" + "=" * 60)
+        print(f"Training ...")
+        print("=" * 60)
+        early_stopping = build_early_stopping()
+        model = NoisePredictor(
+            input_feature_num=INPUT_FEATURE_NUM,
+            hidden_dim=HIDDEN_DIM,
+            timestep_emb_dim=TIMESTEP_EMB_DIM,
+            res_block_num=3,
+        ).to(device)
+        trainer = Trainer(model, scheduler, train_dataset, val_dataset, device=device, early_stopping=early_stopping,
+                          total_epoch=TOTAL_EPOCH, batch_size=BATCH_SIZE, lr=LR,
+                          consistency_loss_weight=CONSISTENCY_LOSS_WEIGHT)
+        model = trainer.run()
+        model.save_pretrained(model_save_path)
+
+    # Testing Phase
+    if is_test:
+        model = NoisePredictor.from_pretrained(model_save_path).to(device)
+        print("\n" + "=" * 60)
+        print(f"Testing ...")
+        print("=" * 60)
+        true_ys, pred_ys = test(model, scheduler, test_dataset, device)
+
+        true_ys = true_ys.view(-1, 1)  # [N] -> [N, 1]
+        pred_ys = pred_ys.view(-1, 1)  # [N] -> [N, 1]
+        # evaluate(true_ys, pred_ys)
 
 
 class NoisePredictor(ModelMixin, ConfigMixin):
@@ -84,10 +139,18 @@ class NoisePredictor(ModelMixin, ConfigMixin):
             lat_max=lat_max
         )
 
-        # Condition Fusion
-        # TODO in-situ 数据参与引导
+        # InSitu (站点) 全局统计特征嵌入（同一日期的全局信息）
+        self.insitu_stats_embedding = nn.Sequential(
+            nn.Linear(4, hidden_dim // 2),  # 8个统计特征 -> hidden_dim//2
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+        # Condition Fusion (now includes global InSitu embedding only)
         self.condition_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim * 2),
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),  # timestep + time + spatial + insitu_global
             nn.SiLU(),
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
@@ -108,7 +171,8 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         )
 
     def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
-                pos: torch.Tensor, dates: List[str]) -> torch.Tensor:
+                pos: torch.Tensor, dates: List[str],
+                insitu_global_stats: torch.Tensor = None) -> torch.Tensor:
         inputs = torch.cat([xs, diffused_ys], dim=1)
         x = self.input_layer(inputs)
 
@@ -122,8 +186,15 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         # Embed Spatial
         embed_spatial = self.spatial_embedding(pos)
 
-        # Fuse Condition
-        condition = torch.cat([embed_timesteps, embed_time, embed_spatial], dim=1)
+        # Embed InSitu Global (全局统计特征)
+        if insitu_global_stats is not None:
+            embed_insitu_global = self.insitu_stats_embedding(insitu_global_stats)
+        else:
+            B = x.shape[0]
+            embed_insitu_global = torch.zeros(B, self.hidden_dim, device=x.device, dtype=x.dtype)
+
+        # Fuse Condition (now includes global InSitu only)
+        condition = torch.cat([embed_timesteps, embed_time, embed_spatial, embed_insitu_global], dim=1)
         condition = self.condition_fusion(condition)
 
         # Residual Blocks with FiLM
@@ -143,7 +214,8 @@ class Trainer:
                  device: str,
                  early_stopping: EarlyStopping,
                  total_epoch: int,
-                 batch_size: int, lr: float):
+                 batch_size: int, lr: float,
+                 consistency_loss_weight: float = 0.3):
         self.model = model
         self.scheduler = scheduler
         self.train_dataset = train_dataset
@@ -153,16 +225,27 @@ class Trainer:
         self.total_epoch = total_epoch
         self.batch_size = batch_size
         self.lr = lr
+        self.consistency_loss_weight = consistency_loss_weight
+        self.bias_loss_weight = BIAS_LOSS_WEIGHT
+        self.var_loss_weight = VAR_LOSS_WEIGHT
 
     def evaluate_epoch(self, data_loader: DataLoader, optimizer: torch.optim.Optimizer = None) -> float:
         total_loss = 0.0
         total_samples = 0
 
-        for batch_xs, batch_ys, batch_pos, batch_dates in data_loader:
+        for batch_data in data_loader:
+            batch_xs, batch_ys, batch_pos, batch_dates, batch_insitu, batch_insitu_mask, batch_insitu_global = batch_data
             batch_xs = batch_xs.to(self.device)
             batch_ys = batch_ys.to(self.device).unsqueeze(1)
             batch_pos = batch_pos.to(self.device)
-            batch_dates = list(batch_dates)  # 转换为列表
+            batch_dates = list(batch_dates)
+
+            if batch_insitu is not None:
+                batch_insitu = batch_insitu.to(self.device)
+                batch_insitu_mask = batch_insitu_mask.to(self.device)
+
+            if batch_insitu_global is not None:
+                batch_insitu_global = batch_insitu_global.to(self.device)
 
             B = batch_xs.shape[0]
 
@@ -180,10 +263,53 @@ class Trainer:
 
             pred_noise = self.model.forward(
                 diffused_ys, batch_xs, sampled_timesteps,
-                pos=batch_pos, dates=batch_dates
+                pos=batch_pos, dates=batch_dates,
+                insitu_global_stats=batch_insitu_global
             )
 
-            loss = nn.functional.mse_loss(pred_noise, noises)
+            diffusion_loss = nn.functional.mse_loss(pred_noise, noises)
+
+            if batch_insitu_mask.sum() > 1:
+                valid_timestep_mask = sampled_timesteps >= MIN_TIMESTEP_FOR_CONSISTENCY
+                if valid_timestep_mask.sum() > 0:
+                    valid_indices = torch.where(valid_timestep_mask)[0]
+                    pred_denoised_list = []
+                    for i in valid_indices:
+                        step_out = self.scheduler.step(
+                            model_output=pred_noise[i:i + 1],
+                            timestep=sampled_timesteps[i].item(),
+                            sample=diffused_ys[i:i + 1]
+                        )
+                        pred_denoised_list.append(step_out.prev_sample.squeeze())
+
+                    if len(pred_denoised_list) > 0:
+                        pred_denoised_valid = torch.stack(pred_denoised_list)
+                        insitu_mask_valid = batch_insitu_mask[valid_indices]
+                        insitu_valid = batch_insitu[valid_indices]
+
+                        def weighted_stats(values, weights):
+                            weight_sum = weights.sum() + 1e-8
+                            mean = (values * weights).sum() / weight_sum
+                            var = ((values - mean) ** 2 * weights).sum() / weight_sum
+                            return mean, var
+
+                        if insitu_mask_valid.sum() > 1:
+                            pred_mean, pred_var = weighted_stats(pred_denoised_valid, insitu_mask_valid)
+                            insitu_mean, insitu_var = weighted_stats(insitu_valid, insitu_mask_valid)
+
+                            bias_loss = (pred_mean - insitu_mean) ** 2
+                            var_loss = (pred_var - insitu_var) ** 2
+                            consistency_loss = self.bias_loss_weight * bias_loss + self.var_loss_weight * var_loss
+                            loss = diffusion_loss + self.consistency_loss_weight * consistency_loss
+                        else:
+                            loss = diffusion_loss
+                    else:
+                        loss = diffusion_loss
+                else:
+                    loss = diffusion_loss
+            else:
+                loss = diffusion_loss
+
             total_loss += loss.item() * B
             total_samples += B
 
@@ -254,7 +380,8 @@ def build_early_stopping() -> EarlyStopping:
 @torch.no_grad()
 def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
                     xs: torch.Tensor, pos: torch.Tensor, dates: List[str],
-                    inference_step_num: int, device: str) -> torch.Tensor:
+                    inference_step_num: int, device: str,
+                    insitu_global_stats: torch.Tensor = None) -> torch.Tensor:
     model.eval()
     B = xs.shape[0]
 
@@ -263,7 +390,9 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
 
     for timestep in scheduler.timesteps:
         timesteps = torch.full((B,), timestep.item(), device=device, dtype=torch.long)
-        pred_noises = model.forward(ys, xs, timesteps, pos=pos, dates=dates)
+        insitu_global_stats = insitu_global_stats.to(device)
+        pred_noises = model.forward(ys, xs, timesteps, pos=pos, dates=dates,
+                                    insitu_global_stats=insitu_global_stats)
         step_out = scheduler.step(model_output=pred_noises, timestep=timestep, sample=ys)
         ys = step_out.prev_sample
 
@@ -273,14 +402,19 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
 def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, device: str):
     data_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)  # type: ignore[arg-type]
 
-    xs, true_ys, pos, dates = next(iter(data_loader))
+    batch_data = next(iter(data_loader))
+    xs, true_ys, pos, dates, insitu, insitu_mask, insitu_global_stats = batch_data
+
     xs = xs.to(device)
     true_ys = true_ys.to(device)
     pos = pos.to(device)
+    insitu = insitu.to(device)
+    insitu_mask = insitu_mask.to(device)
 
     with torch.no_grad():
         pred_ys = reverse_diffuse(
-            model, scheduler, xs, pos, dates, INFERENCE_STEP_NUM, device=device
+            model, scheduler, xs, pos, dates, INFERENCE_STEP_NUM, device=device,
+            insitu_global_stats=insitu_global_stats
         )
 
     true_ys = true_ys.cpu().numpy()
@@ -292,56 +426,29 @@ def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, devi
     true_ys = torch.from_numpy(true_ys).to(device)
     pred_ys = torch.from_numpy(pred_ys).to(device)
 
+    # TODO Change Evaluate place
+    # 评估预测值与真实值（y）
+    print("\n" + "=" * 60)
+    print("Evaluation: Predictions vs True Y")
+    print("=" * 60)
+    evaluate(true_ys.view(-1, 1), pred_ys.view(-1, 1))
+
+    # 评估预测值与站点数据（InSitu）
+    insitu_denormalized = dataset.dataset.denormalize_y(insitu.cpu().numpy())
+    insitu_denormalized = torch.from_numpy(insitu_denormalized).to(device)
+
+    # TODO dimension issue
+    pred_ys_for_eval = pred_ys.view(1, -1, 1)  # [1, N, 1]
+    insitu_for_eval = insitu_denormalized.view(1, -1, 1)  # [1, N, 1]
+    insitu_mask_for_eval = insitu_mask.view(1, -1, 1)  # [1, N, 1]
+
+    print("\n" + "=" * 60)
+    print("Evaluation: Predictions vs InSitu Data")
+    print("=" * 60)
+    print(f"Valid InSitu points: {insitu_mask.sum().item()}")
+    evaluate(pred_ys_for_eval, insitu_for_eval, masks=insitu_mask_for_eval)
+
     return true_ys, pred_ys
-
-
-def main():
-    device = 'cpu'
-    if torch.cuda.is_available():
-        device = 'cuda'
-    elif hasattr(torch.backends, "mps") and torch.mps.is_available():
-        device = 'mps'
-    print(f"Device: {device}")
-
-    scheduler = build_scheduler()
-    model_save_path = PROJ_PATH + "/Checkpoint/DownscaleSM/Diffusers"
-
-    dataset = TrainDataset()
-    train_size = int(0.8 * len(dataset))
-    val_size = int(0.1 * len(dataset))
-    test_size = len(dataset) - train_size - val_size
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size, test_size],
-        generator=torch.Generator().manual_seed(42)
-    )
-
-    model = NoisePredictor(
-        input_feature_num=INPUT_FEATURE_NUM,
-        hidden_dim=HIDDEN_DIM,
-        timestep_emb_dim=TIMESTEP_EMB_DIM,
-        res_block_num=3,
-    ).to(device)
-
-    # Training Phase
-    print("\n" + "=" * 60)
-    print(f"Training ...")
-    print("=" * 60)
-    early_stopping = build_early_stopping()
-    trainer = Trainer(model, scheduler, train_dataset, val_dataset, device=device, early_stopping=early_stopping,
-                      total_epoch=TOTAL_EPOCH, batch_size=BATCH_SIZE, lr=LR)
-    model = trainer.run()
-    model.save_pretrained(model_save_path)
-
-    # Testing Phase
-    model = NoisePredictor.from_pretrained(model_save_path).to(device)
-    print("\n" + "=" * 60)
-    print(f"Testing ...")
-    print("=" * 60)
-    true_ys, pred_ys = test(model, scheduler, test_dataset, device)
-
-    true_ys = true_ys.view(-1, 1)  # [N] -> [N, 1]
-    pred_ys = pred_ys.view(-1, 1)  # [N] -> [N, 1]
-    evaluate(true_ys, pred_ys)
 
 
 if __name__ == "__main__":
