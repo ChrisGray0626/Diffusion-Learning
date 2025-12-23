@@ -10,9 +10,9 @@ services:
     container_name: downscale-sm
     environment:
       - DATA_DIR_PATH=/Data
+      - PYTHONPATH=/App/Src
     volumes:
       - ./Src:/App/Src
       - ./Checkpoint:/App/Checkpoint
       - /Volumes/Elements SE/Data/Downscale-DM:/Data
-    working_dir: /App
     command: python Src/Task/DownscaleSM/Inferencer.py
