@@ -8,6 +8,8 @@
 import os
 from typing import List
 
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from diffusers import DDPMScheduler
@@ -18,7 +20,7 @@ from torch.utils.data import Dataset, DataLoader
 from Constant import RANGE, CHECKPOINT_DIR_PATH
 from Task.DownscaleSM.Dataset import TrainDataset
 from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
-from Util.ModelHelper import SinusoidalPosEmb, EarlyStopping, evaluate
+from Util.ModelHelper import SinusoidalPosEmb, EarlyStopping
 from Util.Util import build_device
 
 # Dataset setting
@@ -45,6 +47,10 @@ LR = 2e-4
 # Early stopping setting
 PATIENCE = 5
 MIN_DELTA = 1e-6
+
+# Valid range for soil moisture
+SM_MIN = 0.02
+SM_MAX = 0.5
 
 
 def main():
@@ -86,8 +92,8 @@ def main():
         print("\n" + "=" * 60)
         print(f"Testing ...")
         print("=" * 60)
-        true_ys, pred_ys, insitu, insitu_mask = test(model, scheduler, test_dataset, device)
-        evaluate_predictions(true_ys, pred_ys, insitu, insitu_mask, test_dataset, device)
+        true_ys, pred_ys, insitus, insitu_masks, dates = test(model, scheduler, test_dataset, device)
+        evaluate(true_ys, pred_ys, insitus, insitu_masks, dates)
 
 
 class NoisePredictor(ModelMixin, ConfigMixin):
@@ -162,7 +168,7 @@ class NoisePredictor(ModelMixin, ConfigMixin):
 
     def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
                 pos: torch.Tensor, dates: List[str],
-                insitu_global_stats: torch.Tensor = None) -> torch.Tensor:
+                insitu_stats: torch.Tensor = None) -> torch.Tensor:
         inputs = torch.cat([xs, diffused_ys], dim=1)
         x = self.input_layer(inputs)
 
@@ -176,15 +182,15 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         # Embed Spatial
         embed_spatial = self.spatial_embedding(pos)
 
-        # Embed InSitu Global (全局统计特征)
-        if insitu_global_stats is not None:
-            embed_insitu_global = self.insitu_stats_embedding(insitu_global_stats)
+        # Embed InSitu Stats
+        if insitu_stats is not None:
+            embed_insitu_stats = self.insitu_stats_embedding(insitu_stats)
         else:
             B = x.shape[0]
-            embed_insitu_global = torch.zeros(B, self.hidden_dim, device=x.device, dtype=x.dtype)
+            embed_insitu_stats = torch.zeros(B, self.hidden_dim, device=x.device, dtype=x.dtype)
 
         # Fuse Condition (now includes global InSitu only)
-        condition = torch.cat([embed_timesteps, embed_time, embed_spatial, embed_insitu_global], dim=1)
+        condition = torch.cat([embed_timesteps, embed_time, embed_spatial, embed_insitu_stats], dim=1)
         condition = self.condition_fusion(condition)
 
         # Residual Blocks with FiLM
@@ -242,7 +248,7 @@ class Trainer:
             pred_noise = self.model.forward(
                 diffused_ys, batch_xs, sampled_timesteps,
                 pos=batch_pos, dates=batch_dates,
-                insitu_global_stats=batch_insitu_stats
+                insitu_stats=batch_insitu_stats
             )
 
             diffusion_loss = nn.functional.mse_loss(pred_noise, noises)
@@ -330,7 +336,7 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
         timesteps = torch.full((B,), timestep.item(), device=device, dtype=torch.long)
         insitu_stats = insitu_stats.to(device)
         pred_noises = model.forward(ys, xs, timesteps, pos=pos, dates=dates,
-                                    insitu_global_stats=insitu_stats)
+                                    insitu_stats=insitu_stats)
         step_out = scheduler.step(model_output=pred_noises, timestep=timestep, sample=ys)
         ys = step_out.prev_sample
 
@@ -355,31 +361,90 @@ def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, devi
 
     true_ys = dataset.dataset.denormalize_y(true_ys)
     pred_ys = dataset.dataset.denormalize_y(pred_ys)
-
-    return true_ys, pred_ys, insitus, insitu_masks
-
-
-def evaluate_predictions(true_ys: torch.Tensor, pred_ys: torch.Tensor,
-                         insitus: torch.Tensor, insitu_masks: torch.Tensor,
-                         dataset: Dataset, device: str):
-    print("\n" + "=" * 60)
-    print("Evaluation: Predictions vs True Y")
-    print("=" * 60)
-
-    evaluate(true_ys.view(-1, 1), pred_ys.view(-1, 1))
-
-    print("\n" + "=" * 60)
-    print("Evaluation: Predictions vs InSitu Data")
-    print("=" * 60)
-    print(f"Valid InSitu points: {insitu_masks.sum().item()}")
-
     insitus = dataset.dataset.denormalize_y(insitus)
+    # Clip
+    pred_ys = torch.clamp(pred_ys, SM_MIN, SM_MAX)
 
-    pred_ys = pred_ys.view(1, -1, 1)
-    insitus = insitus.view(1, -1, 1)
-    insitu_masks = insitu_masks.view(1, -1, 1)
+    return (true_ys.cpu().numpy(), pred_ys.cpu().numpy(),
+            insitus.cpu().numpy(), insitu_masks.cpu().numpy(), dates)
 
-    evaluate(pred_ys, insitus, masks=insitu_masks)
+
+def evaluate(true_ys: np.ndarray, pred_ys: np.ndarray,
+             insitus: np.ndarray, insitu_masks: np.ndarray,
+             dates: List[str]):
+    if pred_ys.ndim == 2:
+        pred_ys = pred_ys.flatten()
+    if true_ys.ndim == 2:
+        true_ys = true_ys.flatten()
+    if insitus.ndim == 2:
+        insitus = insitus.flatten()
+    if insitu_masks.ndim == 2:
+        insitu_masks = insitu_masks.flatten()
+
+    df = pd.DataFrame({
+        'Date': dates,
+        'TrueY': true_ys,
+        'PredY': pred_ys,
+        'Insitu': insitus,
+        'InsituMask': insitu_masks
+    })
+
+    df_results = pd.DataFrame(df.groupby('Date').apply(calc_group_metrics, include_groups=False).dropna().tolist())
+    df_results = df_results.sort_values('InSitu_Corr_R2', ascending=False, na_position='last')
+
+    # Formatted Output Completely
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', None)
+    pd.set_option('display.max_colwidth', None)
+
+    print(df_results.to_string(index=False))
+
+
+def calc_group_metrics(group):
+    true_y = group['TrueY'].values
+    pred_y = group['PredY'].values
+    insitu = group['Insitu'].values
+    insitu_mask = group['InsituMask'].values
+
+    valid_insitu_count = insitu_mask.sum()
+
+    if valid_insitu_count == 0:
+        return None
+
+    result = {
+        'Date': group.name,
+        'Total_Points': len(group),
+        'Valid_InSitu_Points': int(valid_insitu_count)
+    }
+
+    true_y_metrics = calc_metrics(pred_y, true_y)
+    result.update({f'TrueY_{k}': v for k, v in true_y_metrics.items()})
+
+    insitu_valid = insitu[insitu_mask > 0]
+
+    insitu_orig_metrics = calc_metrics(pred_y, insitu, insitu_mask)
+    result.update({f'InSitu_Orig_{k}': v for k, v in insitu_orig_metrics.items()})
+
+    # Correct with InSitu Bias
+    systematic_bias = np.mean(pred_y[insitu_mask > 0] - insitu_valid)
+    pred_corrected = pred_y - systematic_bias
+    insitu_corr_metrics = calc_metrics(pred_corrected, insitu, insitu_mask)
+    result.update({f'InSitu_Corr_{k}': v for k, v in insitu_corr_metrics.items()})
+
+    return result
+
+
+def calc_metrics(pred, true, mask=None):
+    if mask is not None:
+        pred = pred[mask > 0]
+        true = true[mask > 0]
+    mse = np.mean((pred - true) ** 2)
+    bias = np.mean(pred - true)
+    ubrmse = np.sqrt(np.clip(mse - bias ** 2, 0, None))
+    ss_res = np.sum((true - pred) ** 2)
+    ss_tot = np.sum((true - np.mean(true)) ** 2)
+    r2 = 1 - (ss_res / ss_tot) if ss_tot > 1e-8 else (1.0 if ss_res < 1e-8 else np.nan)
+    return {'ubRMSE': ubrmse, 'Bias': bias, 'R2': r2 if np.isfinite(r2) else np.nan}
 
 
 if __name__ == "__main__":

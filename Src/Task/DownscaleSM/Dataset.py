@@ -7,6 +7,7 @@
 """
 
 import os
+from functools import cached_property
 
 import numpy as np
 import torch
@@ -33,6 +34,7 @@ class TrainDataset(Dataset):
 
         # Load multi-date data
         dates = get_valid_dates()
+        self.dates = np.array(dates, dtype=object)
         xs_list = []
         ys_list = []
         for date in dates:
@@ -93,8 +95,7 @@ class TrainDataset(Dataset):
         self.insitus = insitus.reshape(date_num * H * W, -1).astype(np.float32)
         self.insitu_masks = (~np.isnan(self.insitus)).astype(np.float32)
 
-        dates = np.repeat(dates, H * W)
-        self.dates = np.array(dates, dtype=object)
+        # Reshape Date Index
         self.date_indices = np.repeat(np.arange(date_num), H * W).astype(np.int32)
 
     def _filter_valid(self):
@@ -103,7 +104,6 @@ class TrainDataset(Dataset):
         self.xs = self.xs[valid]
         self.pos = self.pos[valid]
         self.ys = self.ys[valid, 0]
-        self.dates = self.dates[valid]
         self.insitus = self.insitus[valid, 0]
         self.insitu_masks = self.insitu_masks[valid, 0]
         self.date_indices = self.date_indices[valid]
@@ -111,6 +111,8 @@ class TrainDataset(Dataset):
     def _normalize_feat(self):
         x_mean = self.xs.mean(axis=0).astype(np.float32)
         x_std = self.xs.std(axis=0).astype(np.float32)
+        self.x_mean = x_mean
+        self.x_std = x_std
         x_std[x_std == 0] = 1.0
         self.xs = (self.xs - x_mean) * (1.0 / x_std)
 
@@ -146,14 +148,17 @@ class TrainDataset(Dataset):
         xs = torch.from_numpy(self.xs[idx]).float()
         ys = torch.tensor(self.ys[idx], dtype=torch.float32)
         pos = torch.from_numpy(self.pos[idx]).float()
-        date = str(self.dates[idx])
+        date_idx = self.date_indices[idx]
+        date = str(self.dates[date_idx])
         insitus = torch.tensor(self.insitus[idx], dtype=torch.float32)
         insitu_masks = torch.tensor(self.insitu_masks[idx], dtype=torch.float32)
-
-        date_idx = self.date_indices[idx]
         insitu_stats = torch.from_numpy(self.insitu_stats[date_idx]).float()
 
         return xs, ys, pos, date, insitus, insitu_masks, insitu_stats
+
+    @cached_property
+    def insitu_stats_dict(self) -> dict:
+        return {str(date): self.insitu_stats[i] for i, date in enumerate(self.dates)}
 
 
 class InferenceDataset(Dataset):

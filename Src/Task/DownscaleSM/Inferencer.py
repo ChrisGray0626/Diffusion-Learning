@@ -47,19 +47,23 @@ def main():
     def denorm_fn(y: torch.Tensor, device: torch.device) -> torch.Tensor:
         return y * y_std.to(device) + y_mean.to(device)
 
+    insitu_stats_dict = train_dataset.insitu_stats_dict
     transform, crs, height, width = read_tiff_meta(REF_GRID_PATH)
     dates = get_valid_dates()
     for date in tqdm(dates):
+        insitu_stats = insitu_stats_dict.get(date, None)
         dataset = InferenceDataset(
             date=date,
             resolution=RESOLUTION,
         )
+
         pred_map = inference(
             dataset=dataset,
             height=height,
             width=width,
             norm_fn=norm_fn,
             denorm_fn=denorm_fn,
+            insitu_stats=insitu_stats,
         )
 
         dst_dir_path = os.path.join(INFERENCE_DIR_PATH, RESOLUTION)
@@ -76,7 +80,8 @@ def build_model() -> NoisePredictor:
 
 
 @torch.no_grad()
-def inference(dataset: Dataset, height: int, width: int, norm_fn, denorm_fn) -> np.ndarray:
+def inference(dataset: Dataset, height: int, width: int, norm_fn, denorm_fn,
+              insitu_stats: np.ndarray | None) -> np.ndarray:
     device = build_device()
     model = build_model().to(device)
     scheduler = build_scheduler()
@@ -91,8 +96,16 @@ def inference(dataset: Dataset, height: int, width: int, norm_fn, denorm_fn) -> 
         batch_xs = norm_fn(batch_xs.to(device))
         batch_pos = batch_pos.to(device)
 
+        if insitu_stats is not None:
+            B = batch_xs.shape[0]
+            batch_insitu_stats = torch.from_numpy(insitu_stats).float().to(device)
+            batch_insitu_stats = batch_insitu_stats.unsqueeze(0).expand(B, -1)
+        else:
+            batch_insitu_stats = None
+
         batch_pred_ys = reverse_diffuse(
-            model, scheduler, batch_xs, batch_pos, batch_dates, INFERENCE_STEP_NUM, device=device
+            model, scheduler, batch_xs, batch_pos, batch_dates, INFERENCE_STEP_NUM,
+            device=device, insitu_stats=batch_insitu_stats  # type: ignore[arg-type]
         )
         batch_pred_ys = batch_pred_ys.reshape(-1)
         # Denormalize
