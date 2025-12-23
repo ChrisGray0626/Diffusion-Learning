@@ -132,7 +132,12 @@ class TrainDataset(Dataset):
         self.insitu_stats = (self.insitu_stats - stats_mean) / stats_std
 
     def denormalize_y(self, ys):
-        return ys * self.y_std + self.y_mean
+        if isinstance(ys, torch.Tensor):
+            y_std = torch.tensor(self.y_std, dtype=ys.dtype, device=ys.device)
+            y_mean = torch.tensor(self.y_mean, dtype=ys.dtype, device=ys.device)
+            return ys * y_std + y_mean
+        else:
+            return ys * self.y_std + self.y_mean
 
     def __len__(self):
         return len(self.xs)
