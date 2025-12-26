@@ -8,8 +8,6 @@
 import os
 from typing import List
 
-import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 from diffusers import DDPMScheduler
@@ -19,6 +17,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from Constant import RANGE, CHECKPOINT_DIR_PATH
 from Task.DownscaleSM.Dataset import TrainDataset
+from Task.DownscaleSM.Evaluator import Evaluator
 from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
 from Util.ModelHelper import SinusoidalPosEmb, EarlyStopping
 from Util.Util import build_device
@@ -93,7 +92,12 @@ def main():
         print(f"Testing ...")
         print("=" * 60)
         true_ys, pred_ys, insitus, insitu_masks, dates = test(model, scheduler, test_dataset, device)
-        evaluate(true_ys, pred_ys, insitus, insitu_masks, dates)
+        evaluator = Evaluator(min_insitu_points=2)
+        df_result = evaluator.evaluate(pred_ys, insitus, insitu_masks, dates, true_ys=true_ys)
+        print("\n" + "=" * 60)
+        print("Evaluation: Test Results vs InSitu Data")
+        print("=" * 60)
+        evaluator.print_result(df_result)
 
 
 class NoisePredictor(ModelMixin, ConfigMixin):
@@ -367,84 +371,6 @@ def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, devi
 
     return (true_ys.cpu().numpy(), pred_ys.cpu().numpy(),
             insitus.cpu().numpy(), insitu_masks.cpu().numpy(), dates)
-
-
-def evaluate(true_ys: np.ndarray, pred_ys: np.ndarray,
-             insitus: np.ndarray, insitu_masks: np.ndarray,
-             dates: List[str]):
-    if pred_ys.ndim == 2:
-        pred_ys = pred_ys.flatten()
-    if true_ys.ndim == 2:
-        true_ys = true_ys.flatten()
-    if insitus.ndim == 2:
-        insitus = insitus.flatten()
-    if insitu_masks.ndim == 2:
-        insitu_masks = insitu_masks.flatten()
-
-    df = pd.DataFrame({
-        'Date': dates,
-        'TrueY': true_ys,
-        'PredY': pred_ys,
-        'Insitu': insitus,
-        'InsituMask': insitu_masks
-    })
-
-    df_results = pd.DataFrame(df.groupby('Date').apply(calc_group_metrics, include_groups=False).dropna().tolist())
-    df_results = df_results.sort_values('InSitu_Corr_R2', ascending=False, na_position='last')
-
-    # Formatted Output Completely
-    pd.set_option('display.max_columns', None)
-    pd.set_option('display.width', None)
-    pd.set_option('display.max_colwidth', None)
-
-    print(df_results.to_string(index=False))
-
-
-def calc_group_metrics(group):
-    true_y = group['TrueY'].values
-    pred_y = group['PredY'].values
-    insitu = group['Insitu'].values
-    insitu_mask = group['InsituMask'].values
-
-    valid_insitu_count = insitu_mask.sum()
-
-    if valid_insitu_count == 0:
-        return None
-
-    result = {
-        'Date': group.name,
-        'Total_Points': len(group),
-        'Valid_InSitu_Points': int(valid_insitu_count)
-    }
-
-    true_y_metrics = calc_metrics(pred_y, true_y)
-    result.update({f'TrueY_{k}': v for k, v in true_y_metrics.items()})
-
-    insitu_valid = insitu[insitu_mask > 0]
-
-    insitu_orig_metrics = calc_metrics(pred_y, insitu, insitu_mask)
-    result.update({f'InSitu_Orig_{k}': v for k, v in insitu_orig_metrics.items()})
-
-    # Correct with InSitu Bias
-    systematic_bias = np.mean(pred_y[insitu_mask > 0] - insitu_valid)
-    pred_corrected = pred_y - systematic_bias
-    insitu_corr_metrics = calc_metrics(pred_corrected, insitu, insitu_mask)
-    result.update({f'InSitu_Corr_{k}': v for k, v in insitu_corr_metrics.items()})
-
-    return result
-
-
-def calc_metrics(pred, true, mask=None):
-    if mask is not None:
-        pred = pred[mask > 0]
-        true = true[mask > 0]
-    mse = np.mean((pred - true) ** 2)
-    bias = np.mean(pred - true)
-    ubrmse = np.sqrt(np.clip(mse - bias ** 2, 0, None))
-    ss_res = np.sum((true - pred) ** 2)
-    ss_tot = np.sum((true - np.mean(true)) ** 2)
-    r2 = 1 - (ss_res / ss_tot) if ss_tot > 1e-8 else (1.0 if ss_res < 1e-8 else np.nan)
-    return {'ubRMSE': ubrmse, 'Bias': bias, 'R2': r2 if np.isfinite(r2) else np.nan}
 
 
 if __name__ == "__main__":
