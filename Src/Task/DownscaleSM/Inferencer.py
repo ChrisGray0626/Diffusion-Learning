@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from Constant import *
-from Task.DownscaleSM.Dataset import InferenceDataset, TrainDataset
+from Task.DownscaleSM.Dataset import InferenceDataset, InsituStatsDataset
 from Task.DownscaleSM.Trainer import NoisePredictor, build_scheduler, reverse_diffuse
 from Util.TiffUtil import write_tiff, read_tiff_meta
 from Util.Util import get_valid_dates, build_device
@@ -25,7 +25,7 @@ BATCH_SIZE = 16384
 SM_MIN = 0.02
 SM_MAX = 0.5
 
-RESOLUTION = RESOLUTION_1KM
+RESOLUTION = RESOLUTION_36KM
 if RESOLUTION == RESOLUTION_1KM:
     REF_GRID_PATH = REF_GRID_1KM_PATH
 else:
@@ -33,37 +33,22 @@ else:
 
 
 def main():
-    print(f"Device: {build_device()}")
+    device = build_device()
+    print(f"Device: {device}")
 
-    train_dataset = TrainDataset()
-    x_mean = torch.from_numpy(train_dataset.x_mean).float()
-    x_std = torch.from_numpy(train_dataset.x_std).float()
-    y_mean = torch.tensor(train_dataset.y_mean, dtype=torch.float32)
-    y_std = torch.tensor(train_dataset.y_std, dtype=torch.float32)
-
-    def norm_fn(x: torch.Tensor) -> torch.Tensor:
-        return (x - x_mean.to(x.device)) / x_std.to(x.device)
-
-    def denorm_fn(y: torch.Tensor, device: torch.device) -> torch.Tensor:
-        return y * y_std.to(device) + y_mean.to(device)
-
-    insitu_stats_dict = train_dataset.insitu_stats_dict
+    insitu_stats_dataset = InsituStatsDataset(resolution=RESOLUTION)
     transform, crs, height, width = read_tiff_meta(REF_GRID_PATH)
     dates = get_valid_dates()
     for date in tqdm(dates):
-        insitu_stats = insitu_stats_dict.get(date, None)
-        dataset = InferenceDataset(
-            date=date,
-            resolution=RESOLUTION,
-        )
+        dataset = InferenceDataset(date=date, resolution=RESOLUTION)
+        insitu_stats = insitu_stats_dataset.get_stats(date)
 
         pred_map = inference(
             dataset=dataset,
             height=height,
             width=width,
-            norm_fn=norm_fn,
-            denorm_fn=denorm_fn,
             insitu_stats=insitu_stats,
+            device=device,
         )
 
         dst_dir_path = os.path.join(INFERENCE_DIR_PATH, RESOLUTION)
@@ -80,9 +65,8 @@ def build_model() -> NoisePredictor:
 
 
 @torch.no_grad()
-def inference(dataset: Dataset, height: int, width: int, norm_fn, denorm_fn,
-              insitu_stats: np.ndarray | None) -> np.ndarray:
-    device = build_device()
+def inference(dataset: Dataset, height: int, width: int, insitu_stats: np.ndarray, device: str,
+              ) -> np.ndarray:
     model = build_model().to(device)
     scheduler = build_scheduler()
     model.eval()
@@ -91,17 +75,15 @@ def inference(dataset: Dataset, height: int, width: int, norm_fn, denorm_fn,
 
     pred_map = np.full((height, width), np.nan, dtype=np.float32)
     pred_ys = []
-    grid_indices = []
-    for batch_xs, batch_pos, batch_dates, batch_grid_indices in tqdm(data_loader):
-        batch_xs = norm_fn(batch_xs.to(device))
+    rows_list = []
+    cols_list = []
+    for batch_xs, batch_pos, batch_dates, batch_rows, batch_cols in tqdm(data_loader):
+        batch_xs = dataset.norm_x(batch_xs.to(device))
         batch_pos = batch_pos.to(device)
 
-        if insitu_stats is not None:
-            B = batch_xs.shape[0]
-            batch_insitu_stats = torch.from_numpy(insitu_stats).float().to(device)
-            batch_insitu_stats = batch_insitu_stats.unsqueeze(0).expand(B, -1)
-        else:
-            batch_insitu_stats = None
+        B = batch_xs.shape[0]
+        batch_insitu_stats = torch.from_numpy(insitu_stats).float().to(device)
+        batch_insitu_stats = batch_insitu_stats.unsqueeze(0).expand(B, -1)
 
         batch_pred_ys = reverse_diffuse(
             model, scheduler, batch_xs, batch_pos, batch_dates, INFERENCE_STEP_NUM,
@@ -109,21 +91,21 @@ def inference(dataset: Dataset, height: int, width: int, norm_fn, denorm_fn,
         )
         batch_pred_ys = batch_pred_ys.reshape(-1)
         # Denormalize
-        batch_pred_ys = denorm_fn(batch_pred_ys, device)
+        batch_pred_ys = dataset.denorm_y(batch_pred_ys)
         # Clip
         batch_pred_ys = torch.clamp(batch_pred_ys, SM_MIN, SM_MAX)
         batch_pred_ys = batch_pred_ys.cpu().numpy()
 
         pred_ys.append(batch_pred_ys)
-        grid_indices.append(batch_grid_indices)
+        rows_list.append(batch_rows.numpy())
+        cols_list.append(batch_cols.numpy())
 
     pred_ys = np.concatenate(pred_ys)
-    grid_indices = np.concatenate(grid_indices)
+    rows = np.concatenate(rows_list)
+    cols = np.concatenate(cols_list)
 
-    # Convert H, W index to Map
-    h_indices = grid_indices // width
-    w_indices = grid_indices % width
-    pred_map[h_indices, w_indices] = pred_ys
+    # Direct assignment using row and col indices
+    pred_map[rows, cols] = pred_ys
 
     return pred_map
 

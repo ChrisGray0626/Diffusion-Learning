@@ -15,11 +15,12 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from Constant import RANGE, CHECKPOINT_DIR_PATH
-from Task.DownscaleSM.Dataset import TrainDataset
+from Constant import RANGE, CHECKPOINT_DIR_PATH, REF_GRID_36KM_PATH, RESOLUTION_36KM
+from Task.DownscaleSM.Dataset import TrainDataset, InsituStatsDataset, InsituDataset
 from Task.DownscaleSM.Evaluator import Evaluator
 from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
 from Util.ModelHelper import SinusoidalPosEmb, EarlyStopping
+from Util.TiffUtil import pos2grid_index
 from Util.Util import build_device
 
 # Dataset setting
@@ -51,6 +52,10 @@ MIN_DELTA = 1e-6
 SM_MIN = 0.02
 SM_MAX = 0.5
 
+# Control Flag
+TRAINING = False
+TEST = True
+
 
 def main():
     device = build_device()
@@ -58,6 +63,7 @@ def main():
     model_save_path = os.path.join(CHECKPOINT_DIR_PATH, "DownscaleSM", "Diffusers")
 
     dataset = TrainDataset()
+    insitu_stats_dataset = InsituStatsDataset()
     train_size = int(0.8 * len(dataset))
     val_size = int(0.1 * len(dataset))
     test_size = len(dataset) - train_size - val_size
@@ -66,10 +72,8 @@ def main():
         generator=torch.Generator().manual_seed(42)
     )
 
-    is_training = True
-    is_test = True
     # Training Phase
-    if is_training:
+    if TRAINING:
         print("\n" + "=" * 60)
         print(f"Training ...")
         print("=" * 60)
@@ -81,23 +85,18 @@ def main():
             res_block_num=3,
         ).to(device)
         trainer = Trainer(model, scheduler, train_dataset, val_dataset, device=device, early_stopping=early_stopping,
+                          insitu_stats_dataset=insitu_stats_dataset,
                           total_epoch=TOTAL_EPOCH, batch_size=BATCH_SIZE, lr=LR)
         model = trainer.run()
         model.save_pretrained(model_save_path)
 
     # Testing Phase
-    if is_test:
-        model = NoisePredictor.from_pretrained(model_save_path).to(device)
+    if TEST:
         print("\n" + "=" * 60)
         print(f"Testing ...")
         print("=" * 60)
-        true_ys, pred_ys, insitus, insitu_masks, dates = test(model, scheduler, test_dataset, device)
-        evaluator = Evaluator(min_insitu_points=2)
-        df_result = evaluator.evaluate(pred_ys, insitus, insitu_masks, dates, true_ys=true_ys)
-        print("\n" + "=" * 60)
-        print("Evaluation: Test Results vs InSitu Data")
-        print("=" * 60)
-        evaluator.print_result(df_result)
+        model = NoisePredictor.from_pretrained(model_save_path).to(device)
+        test(model, scheduler, test_dataset, insitu_stats_dataset, device)
 
 
 class NoisePredictor(ModelMixin, ConfigMixin):
@@ -213,6 +212,7 @@ class Trainer:
                  val_dataset: Dataset,
                  device: str,
                  early_stopping: EarlyStopping,
+                 insitu_stats_dataset: InsituStatsDataset,
                  total_epoch: int,
                  batch_size: int, lr: float):
         self.model = model
@@ -221,6 +221,7 @@ class Trainer:
         self.val_dataset = val_dataset
         self.device = device
         self.early_stopping = early_stopping
+        self.insitu_stats_dataset = insitu_stats_dataset
         self.total_epoch = total_epoch
         self.batch_size = batch_size
         self.lr = lr
@@ -229,11 +230,15 @@ class Trainer:
         total_loss = 0.0
         total_samples = 0
 
-        for batch_xs, batch_ys, batch_pos, batch_dates, _, _, batch_insitu_stats in data_loader:
+        for batch_xs, batch_ys, batch_pos, batch_dates in data_loader:
             batch_xs = batch_xs.to(self.device)
             batch_ys = batch_ys.to(self.device).unsqueeze(1)
             batch_pos = batch_pos.to(self.device)
-            batch_insitu_stats = batch_insitu_stats.to(self.device)
+
+            batch_insitu_stats = torch.stack([
+                torch.from_numpy(self.insitu_stats_dataset.get_stats(date)).float()
+                for date in batch_dates
+            ]).to(self.device)
 
             B = batch_xs.shape[0]
 
@@ -347,30 +352,53 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
     return ys
 
 
-def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset, device: str):
+def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset,
+         insitu_stats_dataset: InsituStatsDataset, device: str):
     data_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)  # type: ignore[arg-type]
-    xs, true_ys, pos, dates, insitus, insitu_masks, insitu_stats = next(iter(data_loader))
-
+    xs, true_ys, pos, dates = next(iter(data_loader))
     xs = xs.to(device)
-    true_ys = true_ys.to(device)
     pos = pos.to(device)
-    insitus = insitus.to(device)
-    insitu_masks = insitu_masks.to(device)
+    insitu_stats = torch.stack([
+        torch.from_numpy(insitu_stats_dataset.get_stats(date)).float()
+        for date in dates
+    ]).to(device)
 
+    # Inference
     with torch.no_grad():
         pred_ys = reverse_diffuse(
             model, scheduler, xs, pos, dates, INFERENCE_STEP_NUM, device=device,
             insitu_stats=insitu_stats
         )
 
-    true_ys = dataset.dataset.denormalize_y(true_ys)
-    pred_ys = dataset.dataset.denormalize_y(pred_ys)
-    insitus = dataset.dataset.denormalize_y(insitus)
-    # Clip
+    # Denormalize & Clip
+    pred_ys = dataset.dataset.denorm_y(pred_ys)
     pred_ys = torch.clamp(pred_ys, SM_MIN, SM_MAX)
+    pred_ys = pred_ys.cpu().numpy()
+    true_ys = dataset.dataset.denorm_y(true_ys)
+    true_ys = true_ys.numpy()
 
-    return (true_ys.cpu().numpy(), pred_ys.cpu().numpy(),
-            insitus.cpu().numpy(), insitu_masks.cpu().numpy(), dates)
+    # Evaluate
+    insitu_dataset = InsituDataset(resolution=RESOLUTION_36KM)
+    rows, cols = pos2grid_index(pos.cpu().numpy(), REF_GRID_36KM_PATH)
+    insitus, insitu_masks = insitu_dataset.get_data_by_date_row_col(dates, rows, cols)
+    evaluator = Evaluator(min_site_num=2, min_date_num=2)
+
+    # Evaluate by Date
+    df_result_date = evaluator.evaluate_by_date(pred_ys, insitus, insitu_masks, dates, true_ys=true_ys)
+    print("\n" + "=" * 60)
+    print("Evaluation by Date: Test Results vs InSitu Data")
+    print("=" * 60)
+    evaluator.print_result(df_result_date)
+
+    # Evaluate by Site
+    df_result_site = evaluator.evaluate_by_site(pred_ys, insitus, insitu_masks, dates, rows, cols, true_ys=true_ys)
+    print("\n" + "=" * 60)
+    print("Evaluation by Site: Test Results vs InSitu Data")
+    print("=" * 60)
+    evaluator.print_result(df_result_site)
+
+    # Evaluate by Spatial Distribution
+    evaluator.evaluate_by_spatial_distribution(df_result_site)
 
 
 if __name__ == "__main__":

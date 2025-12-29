@@ -48,6 +48,39 @@ def read_tiff(file_path: str, dst_epsg_code: int = 4326):
     return data, xs, ys
 
 
+def pos2grid_index(pos: np.ndarray, ref_grid_path: str) -> Tuple[np.ndarray, np.ndarray]:
+    _, _, H, W = read_tiff_meta(ref_grid_path)
+    _, lon_grid, lat_grid = read_tiff(ref_grid_path, dst_epsg_code=4326)
+
+    # Decimal rounding
+    pos_rounded = np.round(pos, decimals=6)
+
+    lon_grid_flat = lon_grid.flatten()
+    lat_grid_flat = lat_grid.flatten()
+
+    # Match positions to grid points
+    rows = []
+    cols = []
+    for i in range(len(pos)):
+        lon, lat = pos_rounded[i, 0], pos_rounded[i, 1]
+
+        # Manhattan Distance
+        lon_diff = np.abs(lon_grid_flat - lon)
+        lat_diff = np.abs(lat_grid_flat - lat)
+        match_idx = np.argmin(lon_diff + lat_diff)
+
+        # 1D to 2D Index
+        row, col = divmod(match_idx, W)
+        rows.append(int(row))
+        cols.append(int(col))
+
+    # Return as native integer arrays (int32)
+    rows = np.array(rows, dtype=np.int32)
+    cols = np.array(cols, dtype=np.int32)
+
+    return rows, cols
+
+
 def write_tiff(data,
                dst_file_path: str,
                transform: rasterio.Affine,

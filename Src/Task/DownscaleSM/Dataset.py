@@ -25,7 +25,7 @@ class TrainDataset(Dataset):
     def __init__(self):
         self._load_data()
         self._filter_valid()
-        self._normalize_feat()
+        self._norm()
 
     def _load_data(self):
         # Load DEM data
@@ -69,33 +69,6 @@ class TrainDataset(Dataset):
         pos_expanded = np.tile(pos_grid[np.newaxis, :, :, :], (date_num, 1, 1, 1))
         self.pos = pos_expanded.reshape(date_num * H * W, -1).astype(np.float32)
 
-        # Load InSitu data
-        insitu_list = []
-        insitu_stats_list = []
-
-        for date in dates:
-            insitu_path = os.path.join(PROCESSED_DIR_PATH, IN_SITU_NAME, RESOLUTION_36KM, f'{date}{TIFF_SUFFIX}')
-            insitu_data = read_tiff_data(insitu_path).astype(np.float32)
-            insitu_list.append(insitu_data)
-
-            valid_insitu = insitu_data[~np.isnan(insitu_data)]
-            if len(valid_insitu) > 0:
-                raw_stats = np.array([
-                    np.mean(valid_insitu),
-                    np.std(valid_insitu),
-                    np.percentile(valid_insitu, 25),
-                    np.percentile(valid_insitu, 75),
-                ], dtype=np.float32)
-            else:
-                raw_stats = np.zeros(4, dtype=np.float32)
-            insitu_stats_list.append(raw_stats)
-
-        self.insitu_stats = np.array(insitu_stats_list, dtype=np.float32)
-        insitus = np.array(insitu_list, dtype=np.float32)
-        self.insitus = insitus.reshape(date_num * H * W, -1).astype(np.float32)
-        self.insitu_masks = (~np.isnan(self.insitus)).astype(np.float32)
-
-        # Reshape Date Index
         self.date_indices = np.repeat(np.arange(date_num), H * W).astype(np.int32)
 
     def _filter_valid(self):
@@ -104,36 +77,19 @@ class TrainDataset(Dataset):
         self.xs = self.xs[valid]
         self.pos = self.pos[valid]
         self.ys = self.ys[valid, 0]
-        self.insitus = self.insitus[valid, 0]
-        self.insitu_masks = self.insitu_masks[valid, 0]
         self.date_indices = self.date_indices[valid]
 
-    def _normalize_feat(self):
-        x_mean = self.xs.mean(axis=0).astype(np.float32)
-        x_std = self.xs.std(axis=0).astype(np.float32)
-        self.x_mean = x_mean
-        self.x_std = x_std
-        x_std[x_std == 0] = 1.0
-        self.xs = (self.xs - x_mean) * (1.0 / x_std)
+    def _norm(self):
+        self.x_mean = self.xs.mean(axis=0).astype(np.float32)
+        self.x_std = self.xs.std(axis=0).astype(np.float32)
+        self.x_std[self.x_std == 0] = 1.0
+        self.xs = (self.xs - self.x_mean) / self.x_std
 
         self.y_mean = self.ys.mean()
         self.y_std = self.ys.std()
         self.ys = (self.ys - self.y_mean) / self.y_std
 
-        self.insitus = np.where(
-            self.insitu_masks > 0,
-            (self.insitus - self.y_mean) / self.y_std,
-            0.0
-        ).astype(np.float32)
-        self.insitu_stats = (self.insitu_stats - self.y_mean) / self.y_std
-
-        # Normalize InSitu stats
-        stats_mean = self.insitu_stats.mean(axis=0)
-        stats_std = self.insitu_stats.std(axis=0)
-        stats_std[stats_std == 0] = 1.0
-        self.insitu_stats = (self.insitu_stats - stats_mean) / stats_std
-
-    def denormalize_y(self, ys):
+    def denorm_y(self, ys):
         if isinstance(ys, torch.Tensor):
             y_std = torch.tensor(self.y_std, dtype=ys.dtype, device=ys.device)
             y_mean = torch.tensor(self.y_mean, dtype=ys.dtype, device=ys.device)
@@ -150,24 +106,18 @@ class TrainDataset(Dataset):
         pos = torch.from_numpy(self.pos[idx]).float()
         date_idx = self.date_indices[idx]
         date = str(self.dates[date_idx])
-        insitus = torch.tensor(self.insitus[idx], dtype=torch.float32)
-        insitu_masks = torch.tensor(self.insitu_masks[idx], dtype=torch.float32)
-        insitu_stats = torch.from_numpy(self.insitu_stats[date_idx]).float()
 
-        return xs, ys, pos, date, insitus, insitu_masks, insitu_stats
-
-    @cached_property
-    def insitu_stats_dict(self) -> dict:
-        return {str(date): self.insitu_stats[i] for i, date in enumerate(self.dates)}
+        return xs, ys, pos, date
 
 
 class InferenceDataset(Dataset):
 
-    def __init__(self, date: str, resolution: str = RESOLUTION_1KM):
+    def __init__(self, date: str, resolution: str):
         self.date = date
         self.resolution = resolution
         self._load_data()
         self._filter_valid()
+        self.train_dataset = TrainDataset()
 
     def _load_data(self):
         # Load DEM data
@@ -199,14 +149,27 @@ class InferenceDataset(Dataset):
         pos_grid = np.stack([grid_lon, grid_lat], axis=-1).astype(np.float32)
         self.pos = pos_grid.reshape(H * W, -1).astype(np.float32)
 
-        # Local indices
-        self.grid_indices = np.arange(H * W, dtype=np.int64)
+        # Row & Col Index
+        rows, cols = np.meshgrid(np.arange(H, dtype=np.int32), np.arange(W, dtype=np.int32), indexing='ij')
+        self.rows = rows.flatten()
+        self.cols = cols.flatten()
 
     def _filter_valid(self):
         valid = ~np.isnan(self.xs).any(axis=1)
+
         self.xs = self.xs[valid]
         self.pos = self.pos[valid]
-        self.grid_indices = self.grid_indices[valid]
+        self.rows = self.rows[valid]
+        self.cols = self.cols[valid]
+
+    def norm_x(self, xs: torch.Tensor) -> torch.Tensor:
+        x_mean = torch.tensor(self.train_dataset.x_mean, dtype=xs.dtype, device=xs.device)
+        x_std = torch.tensor(self.train_dataset.x_std, dtype=xs.dtype, device=xs.device)
+
+        return (xs - x_mean) / x_std
+
+    def denorm_y(self, ys: torch.Tensor) -> torch.Tensor:
+        return self.train_dataset.denorm_y(ys)
 
     def __len__(self):
         return len(self.xs)
@@ -215,6 +178,144 @@ class InferenceDataset(Dataset):
         xs = torch.from_numpy(self.xs[idx]).float()
         pos = torch.from_numpy(self.pos[idx]).float()
         date = self.date
-        grid_idx = self.grid_indices[idx]
+        row = self.rows[idx]
+        col = self.cols[idx]
 
-        return xs, pos, date, grid_idx
+        return xs, pos, date, row, col
+
+
+class InsituStatsDataset:
+    def __init__(self, resolution: str = RESOLUTION_36KM):
+        self.resolution = resolution
+        self._load_data()
+        self._norm()
+
+    def _load_data(self):
+        insitu_dir = os.path.join(PROCESSED_DIR_PATH, IN_SITU_NAME, self.resolution)
+        self.dates = np.array(get_valid_dates(), dtype=str)
+
+        insitu_stats_list = []
+        for date in self.dates:
+            insitu_path = os.path.join(insitu_dir, f'{date}{TIFF_SUFFIX}')
+            if not os.path.exists(insitu_path):
+                insitu_stats_list.append(np.zeros(4, dtype=np.float32))
+                continue
+
+            insitu_data = read_tiff_data(insitu_path).astype(np.float32)
+            raw_stats = self._calc_insitu_stats_from_data(insitu_data)
+            insitu_stats_list.append(raw_stats)
+
+        self.insitu_stats = np.array(insitu_stats_list, dtype=np.float32)
+
+    @staticmethod
+    def _calc_insitu_stats_from_data(insitu_data: np.ndarray) -> np.ndarray:
+        valid_insitu = insitu_data[~np.isnan(insitu_data)]
+        if len(valid_insitu) > 0:
+            raw_stats = np.array([
+                np.mean(valid_insitu),
+                np.std(valid_insitu),
+                np.percentile(valid_insitu, 25),
+                np.percentile(valid_insitu, 75),
+            ], dtype=np.float32)
+        else:
+            raw_stats = np.zeros(4, dtype=np.float32)
+        return raw_stats
+
+    def _norm(self):
+        stats_mean = self.insitu_stats.mean(axis=0)
+        stats_std = self.insitu_stats.std(axis=0)
+        stats_std[stats_std == 0] = 1.0
+        self.insitu_stats = (self.insitu_stats - stats_mean) / stats_std
+
+    def get_stats(self, date: str) -> np.ndarray:
+        date_idx = np.where(self.dates == date)[0]
+        if len(date_idx) == 0:
+            return np.zeros(4, dtype=np.float32)
+        return self.insitu_stats[date_idx[0]]
+
+    @cached_property
+    def stats_dict(self) -> dict:
+        return {str(date): self.insitu_stats[i] for i, date in enumerate(self.dates)}
+
+
+class InsituDataset(Dataset):
+    def __init__(self, resolution: str = RESOLUTION_36KM):
+        self.resolution = resolution
+        self._load_data()
+
+    def _load_data(self):
+        insitu_dir = os.path.join(PROCESSED_DIR_PATH, IN_SITU_NAME, self.resolution)
+        if self.resolution == RESOLUTION_1KM:
+            ref_grid_path = REF_GRID_1KM_PATH
+        else:
+            ref_grid_path = REF_GRID_36KM_PATH
+
+        _, lon_grid, lat_grid = read_tiff(ref_grid_path, dst_epsg_code=4326)
+        H, W = lon_grid.shape
+        lon_flat = lon_grid.flatten()
+        lat_flat = lat_grid.flatten()
+        pos_flat = np.stack([lon_flat, lat_flat], axis=-1)
+
+        rows, cols = np.meshgrid(np.arange(H, dtype=np.int32), np.arange(W, dtype=np.int32), indexing='ij')
+        rows = rows.flatten()
+        cols = cols.flatten()
+
+        all_insitus = []
+        all_dates = []
+        all_pos = []
+        all_rows = []
+        all_cols = []
+        dates_list = get_valid_dates()
+        for date in dates_list:
+            insitu_path = os.path.join(insitu_dir, f'{date}{TIFF_SUFFIX}')
+            if not os.path.exists(insitu_path):
+                continue
+
+            insitu_map = read_tiff_data(insitu_path).astype(np.float32).flatten()
+
+            all_insitus.append(insitu_map)
+            all_dates.extend([date] * len(insitu_map))
+            all_pos.append(pos_flat)
+            all_rows.append(rows)
+            all_cols.append(cols)
+
+        self.insitus = np.concatenate(all_insitus)
+        self.pos = np.concatenate(all_pos)
+        self.rows = np.concatenate(all_rows)
+        self.cols = np.concatenate(all_cols)
+        self.dates = np.array(all_dates, dtype=object)
+        self.insitu_masks = (~np.isnan(self.insitus)).astype(np.float32)
+
+    def __len__(self):
+        return len(self.insitus)
+
+    def __getitem__(self, idx):
+        return {
+            'insitu': self.insitus[idx],
+            'insitu_mask': self.insitu_masks[idx],
+            'pos': self.pos[idx],
+            'row': self.rows[idx],
+            'col': self.cols[idx],
+            'date': str(self.dates[idx])
+        }
+
+    def get_data_by_date_row_col(self, dates: list, rows: np.ndarray, cols: np.ndarray) -> tuple:
+        lookup = {}
+        for i in range(len(self.dates)):
+            key = (str(self.dates[i]), int(self.rows[i]), int(self.cols[i]))
+            lookup[key] = (self.insitus[i], self.insitu_masks[i])
+
+        matched_insitus = []
+        matched_insitu_masks = []
+
+        for i, date in enumerate(dates):
+            key = (date, int(rows[i]), int(cols[i]))
+            if key in lookup:
+                insitu_val, insitu_mask = lookup[key]
+                matched_insitus.append(insitu_val)
+                matched_insitu_masks.append(insitu_mask)
+            else:
+                matched_insitus.append(np.nan)
+                matched_insitu_masks.append(0.0)
+
+        return np.array(matched_insitus), np.array(matched_insitu_masks)
