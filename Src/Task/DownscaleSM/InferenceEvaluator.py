@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-@Description Evaluate Inference Results
+@Description Evaluate Inference Result
 @Author Chris
 @Date 2025/12/12
 """
@@ -10,58 +10,109 @@ import os
 
 import numpy as np
 
-from Constant import INFERENCE_DIR_PATH, RESOLUTION_1KM, REF_GRID_1KM_PATH, REF_GRID_36KM_PATH, \
-    TIFF_SUFFIX, PROCESSED_DIR_PATH, IN_SITU_NAME
+from Constant import RESOLUTION_1KM, RESOLUTION_36KM, REF_GRID_1KM_PATH, REF_GRID_36KM_PATH, \
+    INFERENCE_DIR_PATH, TIFF_SUFFIX
+from Task.DownscaleSM.Dataset import InsituDataset
 from Task.DownscaleSM.Evaluator import Evaluator
-from Util.TiffUtil import read_tiff_data
+from Util.TiffUtil import read_tiff_data, read_tiff
 from Util.Util import get_valid_dates
 
-RESOLUTION = RESOLUTION_1KM
+RESOLUTION = RESOLUTION_36KM
 if RESOLUTION == RESOLUTION_1KM:
     REF_GRID_PATH = REF_GRID_1KM_PATH
 else:
     REF_GRID_PATH = REF_GRID_36KM_PATH
 
-INFERENCE_DIR_PATH = os.path.join(INFERENCE_DIR_PATH, RESOLUTION)
-
 
 def main():
+    print(f"\n{'=' * 60}")
+    print(f"Evaluating Inference Results: {RESOLUTION}")
+    print("=" * 60)
+
+    # Load inference results
+    pred_ys, pred_dates, pred_pos, pred_rows, pred_cols = load_inference_results(RESOLUTION)
+
+    # Load and match insitu data
+    insitu_dataset = InsituDataset(resolution=RESOLUTION)
+    insitus, insitu_masks = insitu_dataset.get_data_by_date_row_col(pred_dates, pred_rows, pred_cols)
+
+    # Filter to only valid insitu points
+    valid_mask = insitu_masks > 0
+    pred_ys = pred_ys[valid_mask]
+    insitus = insitus[valid_mask]
+    insitu_masks = insitu_masks[valid_mask]
+    dates = [pred_dates[i] for i in range(len(pred_dates)) if valid_mask[i]]
+    rows = pred_rows[valid_mask]
+    cols = pred_cols[valid_mask]
+
+    # Initialize evaluator
+    evaluator = Evaluator(min_site_num=2, min_date_num=2)
+
+    # Evaluate by Date
+    df_result_date = evaluator.evaluate_by_date(
+        pred_ys, insitus, insitu_masks, dates, true_ys=None
+    )
+    print("\n" + "=" * 60)
+    print(f"Evaluation by Date: {RESOLUTION} Inference Results vs InSitu Data")
+    print("=" * 60)
+    evaluator.print_result(df_result_date)
+
+    # Evaluate by Site
+    df_result_site = evaluator.evaluate_by_site(
+        pred_ys, insitus, insitu_masks, dates, rows, cols, true_ys=None
+    )
+    print("\n" + "=" * 60)
+    print(f"Evaluation by Site: {RESOLUTION} Inference Results vs InSitu Data")
+    print("=" * 60)
+    evaluator.print_result(df_result_site)
+
+    # Evaluate by Spatial Distribution
+    evaluator.evaluate_by_spatial_distribution(df_result_site)
+
+
+# TODO Inference Result Dataset?
+def load_inference_results(resolution: str) -> tuple:
+    inference_dir = os.path.join(INFERENCE_DIR_PATH, resolution)
     dates = get_valid_dates()
 
-    all_inference_ys = []
-    all_insitus = []
-    all_insitu_masks = []
-    all_dates = []
+    if resolution == RESOLUTION_1KM:
+        ref_grid_path = REF_GRID_1KM_PATH
+    else:
+        ref_grid_path = REF_GRID_36KM_PATH
+
+    _, lon_grid, lat_grid = read_tiff(ref_grid_path, dst_epsg_code=4326)
+    H, W = lon_grid.shape
+    pos_flat = np.stack([lon_grid.flatten(), lat_grid.flatten()], axis=-1)
+    rows, cols = np.meshgrid(np.arange(H, dtype=np.int32), np.arange(W, dtype=np.int32), indexing='ij')
+    rows_flat, cols_flat = rows.flatten(), cols.flatten()
+
+    all_pred_ys, all_dates, all_pos, all_rows, all_cols = [], [], [], [], []
 
     for date in dates:
-        inference_tiff_path = os.path.join(INFERENCE_DIR_PATH, f"{date}{TIFF_SUFFIX}")
+        inference_tiff_path = os.path.join(inference_dir, f"{date}{TIFF_SUFFIX}")
         if not os.path.exists(inference_tiff_path):
             continue
 
-        inference_map = read_tiff_data(inference_tiff_path).astype(np.float32)
-        insitu_path = os.path.join(PROCESSED_DIR_PATH, IN_SITU_NAME, RESOLUTION, f'{date}{TIFF_SUFFIX}')
-        insitu_map = read_tiff_data(insitu_path).astype(np.float32)
+        pred_map = read_tiff_data(inference_tiff_path).astype(np.float32)
+        pred_flat = pred_map.flatten()
+        valid_mask = ~np.isnan(pred_flat)
 
-        inference_map = inference_map.flatten()
-        insitu_map = insitu_map.flatten()
-        insitu_masks = (~np.isnan(insitu_map)).astype(np.float32)
+        all_pred_ys.append(pred_flat[valid_mask])
+        all_dates.extend([date] * valid_mask.sum())
+        all_pos.append(pos_flat[valid_mask])
+        all_rows.append(rows_flat[valid_mask])
+        all_cols.append(cols_flat[valid_mask])
 
-        all_inference_ys.append(inference_map)
-        all_insitus.append(insitu_map)
-        all_insitu_masks.append(insitu_masks)
-        all_dates.extend([date] * len(inference_map))
+    if len(all_pred_ys) == 0:
+        raise ValueError(f"No inference data found for resolution {resolution}")
 
-    inference_ys = np.concatenate(all_inference_ys)
-    insitus = np.concatenate(all_insitus)
-    insitu_masks = np.concatenate(all_insitu_masks)
-
-    evaluator = Evaluator(min_insitu_points=2)
-    df_result = evaluator.evaluate(inference_ys, insitus, insitu_masks, all_dates, true_ys=None)
-
-    print("\n" + "=" * 60)
-    print("Evaluation: Inference Results vs InSitu Data")
-    print("=" * 60)
-    evaluator.print_result(df_result)
+    return (
+        np.concatenate(all_pred_ys),
+        all_dates,
+        np.concatenate(all_pos),
+        np.concatenate(all_rows),
+        np.concatenate(all_cols)
+    )
 
 
 if __name__ == "__main__":
