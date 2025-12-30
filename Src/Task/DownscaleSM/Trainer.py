@@ -53,7 +53,7 @@ SM_MIN = 0.02
 SM_MAX = 0.5
 
 # Control Flag
-TRAINING = False
+TRAINING = True
 TEST = True
 
 
