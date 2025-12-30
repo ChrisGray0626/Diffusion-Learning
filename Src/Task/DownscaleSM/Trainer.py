@@ -35,8 +35,6 @@ BETA_END = 0.02
 HIDDEN_DIM = 512
 TIMESTEP_EMB_DIM = 128
 
-# Inference setting
-# Less inference steps for faster sampling
 INFERENCE_STEP_NUM = 50
 
 # Train setting
@@ -138,18 +136,18 @@ class NoisePredictor(ModelMixin, ConfigMixin):
             lat_max=lat_max
         )
 
-        # InSitu (站点) 全局统计特征嵌入（同一日期的全局信息）
+        # InSitu Stat
         self.insitu_stats_embedding = nn.Sequential(
-            nn.Linear(4, hidden_dim // 2),  # 8个统计特征 -> hidden_dim//2
+            nn.Linear(4, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
 
-        # Condition Fusion (now includes global InSitu embedding only)
+        # Condition Fusion
         self.condition_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim * 2),  # timestep + time + spatial + insitu_global
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),
             nn.SiLU(),
             nn.Linear(hidden_dim * 2, hidden_dim)
         )
@@ -192,7 +190,7 @@ class NoisePredictor(ModelMixin, ConfigMixin):
             B = x.shape[0]
             embed_insitu_stats = torch.zeros(B, self.hidden_dim, device=x.device, dtype=x.dtype)
 
-        # Fuse Condition (now includes global InSitu only)
+        # Fuse Condition
         condition = torch.cat([embed_timesteps, embed_time, embed_spatial, embed_insitu_stats], dim=1)
         condition = self.condition_fusion(condition)
 
@@ -398,7 +396,7 @@ def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset,
     evaluator.print_result(df_result_site)
 
     # Evaluate by Spatial Distribution
-    evaluator.evaluate_by_spatial_distribution(df_result_site)
+    evaluator.evaluate_by_spatial_distribution(df_result_site, height=insitu_dataset.H, width=insitu_dataset.W)
 
 
 if __name__ == "__main__":

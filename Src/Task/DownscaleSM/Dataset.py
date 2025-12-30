@@ -6,16 +6,13 @@
   @Date 2025/11/12
 """
 
-import os
 from functools import cached_property
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from Constant import DEM_NAME, RESOLUTION_36KM, RESOLUTION_1KM, TIFF_SUFFIX, REF_GRID_36KM_PATH, \
-    REF_GRID_1KM_PATH, \
-    NDVI_NAME, PRECIPITATION_NAME, ALBEDO_NAME, LST_NAME, SM_NAME, PROCESSED_DIR_PATH, IN_SITU_NAME
+from Constant import *
 from Util.TiffUtil import read_tiff, read_tiff_data
 from Util.Util import get_valid_dates
 
@@ -239,83 +236,66 @@ class InsituStatsDataset:
 
 
 class InsituDataset(Dataset):
-    def __init__(self, resolution: str = RESOLUTION_36KM):
+    def __init__(self, resolution: str):
         self.resolution = resolution
-        self._load_data()
+        self.insitu_dir = os.path.join(PROCESSED_DIR_PATH, IN_SITU_NAME, self.resolution)
 
-    def _load_data(self):
-        insitu_dir = os.path.join(PROCESSED_DIR_PATH, IN_SITU_NAME, self.resolution)
-        if self.resolution == RESOLUTION_1KM:
-            ref_grid_path = REF_GRID_1KM_PATH
-        else:
-            ref_grid_path = REF_GRID_36KM_PATH
-
+        ref_grid_path = REF_GRID_1KM_PATH if self.resolution == RESOLUTION_1KM else REF_GRID_36KM_PATH
         _, lon_grid, lat_grid = read_tiff(ref_grid_path, dst_epsg_code=4326)
-        H, W = lon_grid.shape
-        lon_flat = lon_grid.flatten()
-        lat_flat = lat_grid.flatten()
-        pos_flat = np.stack([lon_flat, lat_flat], axis=-1)
+        self.H, self.W = lon_grid.shape
+        self._cache = {}
 
-        rows, cols = np.meshgrid(np.arange(H, dtype=np.int32), np.arange(W, dtype=np.int32), indexing='ij')
-        rows = rows.flatten()
-        cols = cols.flatten()
+    def _load_date_data(self, date: str):
+        if date in self._cache:
+            return self._cache[date]
+        insitu_path = os.path.join(self.insitu_dir, f'{date}{TIFF_SUFFIX}')
+        insitu_map = read_tiff_data(insitu_path).astype(np.float32).flatten() if os.path.exists(
+            insitu_path) else np.full(self.H * self.W, np.nan, dtype=np.float32)
+        insitu_mask = (~np.isnan(insitu_map)).astype(np.float32)
+        self._cache[date] = (insitu_map, insitu_mask)
+        return self._cache[date]
 
-        all_insitus = []
-        all_dates = []
-        all_pos = []
-        all_rows = []
-        all_cols = []
-        dates_list = get_valid_dates()
-        for date in dates_list:
-            insitu_path = os.path.join(insitu_dir, f'{date}{TIFF_SUFFIX}')
-            if not os.path.exists(insitu_path):
-                continue
-
-            insitu_map = read_tiff_data(insitu_path).astype(np.float32).flatten()
-
-            all_insitus.append(insitu_map)
-            all_dates.extend([date] * len(insitu_map))
-            all_pos.append(pos_flat)
-            all_rows.append(rows)
-            all_cols.append(cols)
-
-        self.insitus = np.concatenate(all_insitus)
-        self.pos = np.concatenate(all_pos)
-        self.rows = np.concatenate(all_rows)
-        self.cols = np.concatenate(all_cols)
-        self.dates = np.array(all_dates, dtype=object)
-        self.insitu_masks = (~np.isnan(self.insitus)).astype(np.float32)
-
-    def __len__(self):
-        return len(self.insitus)
-
-    def __getitem__(self, idx):
-        return {
-            'insitu': self.insitus[idx],
-            'insitu_mask': self.insitu_masks[idx],
-            'pos': self.pos[idx],
-            'row': self.rows[idx],
-            'col': self.cols[idx],
-            'date': str(self.dates[idx])
-        }
+    def get_data_by_date(self, date: str) -> tuple:
+        insitu_map, insitu_mask = self._load_date_data(date)
+        rows, cols = np.meshgrid(np.arange(self.H, dtype=np.int32), np.arange(self.W, dtype=np.int32), indexing='ij')
+        return insitu_map, insitu_mask, rows.flatten(), cols.flatten()
 
     def get_data_by_date_row_col(self, dates: list, rows: np.ndarray, cols: np.ndarray) -> tuple:
-        lookup = {}
-        for i in range(len(self.dates)):
-            key = (str(self.dates[i]), int(self.rows[i]), int(self.cols[i]))
-            lookup[key] = (self.insitus[i], self.insitu_masks[i])
-
-        matched_insitus = []
-        matched_insitu_masks = []
-
+        unique_dates = list(set(dates))
+        date_data_cache = {date: self._load_date_data(date) for date in unique_dates}
+        indices = rows.astype(np.int32) * self.W + cols.astype(np.int32)
+        matched_insitus, matched_insitu_masks = [], []
         for i, date in enumerate(dates):
-            key = (date, int(rows[i]), int(cols[i]))
-            if key in lookup:
-                insitu_val, insitu_mask = lookup[key]
-                matched_insitus.append(insitu_val)
-                matched_insitu_masks.append(insitu_mask)
-            else:
-                matched_insitus.append(np.nan)
-                matched_insitu_masks.append(0.0)
-
+            insitu_map, insitu_mask = date_data_cache[date]
+            matched_insitus.append(insitu_map[indices[i]])
+            matched_insitu_masks.append(insitu_mask[indices[i]])
         return np.array(matched_insitus), np.array(matched_insitu_masks)
+
+
+class InferenceResultDataset(Dataset):
+    def __init__(self, resolution: str):
+        self.resolution = resolution
+        self.inference_dir = os.path.join(INFERENCE_DIR_PATH, self.resolution)
+        ref_grid_path = REF_GRID_1KM_PATH if self.resolution == RESOLUTION_1KM else REF_GRID_36KM_PATH
+        _, lon_grid, lat_grid = read_tiff(ref_grid_path, dst_epsg_code=4326)
+        self.H, self.W = lon_grid.shape
+        rows, cols = np.meshgrid(np.arange(self.H, dtype=np.int32), np.arange(self.W, dtype=np.int32), indexing='ij')
+        self.rows_flat = rows.flatten()
+        self.cols_flat = cols.flatten()
+        self._cache = {}
+
+    def _load_date_data(self, date: str):
+        if date in self._cache:
+            return self._cache[date]
+        inference_tiff_path = os.path.join(self.inference_dir, f"{date}{TIFF_SUFFIX}")
+        if not os.path.exists(inference_tiff_path):
+            pred_map = np.full(self.H * self.W, np.nan, dtype=np.float32)
+        else:
+            pred_map = read_tiff_data(inference_tiff_path).astype(np.float32).flatten()
+        valid_mask = ~np.isnan(pred_map)
+        self._cache[date] = (pred_map, valid_mask)
+        return self._cache[date]
+
+    def get_data_by_date(self, date: str) -> tuple:
+        pred_map, pred_mask = self._load_date_data(date)
+        return pred_map, pred_mask, self.rows_flat, self.cols_flat

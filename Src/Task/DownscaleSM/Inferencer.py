@@ -17,19 +17,13 @@ from Task.DownscaleSM.Trainer import NoisePredictor, build_scheduler, reverse_di
 from Util.TiffUtil import write_tiff, read_tiff_meta
 from Util.Util import get_valid_dates, build_device
 
-# Inference settings
 INFERENCE_STEP_NUM = 50
 BATCH_SIZE = 16384
-
-# Valid range for soil moisture
 SM_MIN = 0.02
 SM_MAX = 0.5
 
 RESOLUTION = RESOLUTION_1KM
-if RESOLUTION == RESOLUTION_1KM:
-    REF_GRID_PATH = REF_GRID_1KM_PATH
-else:
-    REF_GRID_PATH = REF_GRID_36KM_PATH
+REF_GRID_PATH = REF_GRID_1KM_PATH if RESOLUTION == RESOLUTION_1KM else REF_GRID_36KM_PATH
 
 
 def main():
@@ -65,48 +59,31 @@ def build_model() -> NoisePredictor:
 
 
 @torch.no_grad()
-def inference(dataset: Dataset, height: int, width: int, insitu_stats: np.ndarray, device: str,
-              ) -> np.ndarray:
+def inference(dataset: Dataset, height: int, width: int, insitu_stats: np.ndarray, device: str) -> np.ndarray:
     model = build_model().to(device)
     scheduler = build_scheduler()
     model.eval()
 
     data_loader = DataLoader(dataset, batch_size=min(BATCH_SIZE, len(dataset)), shuffle=False)  # type: ignore[arg-type]
-
     pred_map = np.full((height, width), np.nan, dtype=np.float32)
-    pred_ys = []
-    rows_list = []
-    cols_list = []
+    pred_ys, rows_list, cols_list = [], [], []
+
     for batch_xs, batch_pos, batch_dates, batch_rows, batch_cols in tqdm(data_loader):
         batch_xs = dataset.norm_x(batch_xs.to(device))
         batch_pos = batch_pos.to(device)
-
         B = batch_xs.shape[0]
-        batch_insitu_stats = torch.from_numpy(insitu_stats).float().to(device)
-        batch_insitu_stats = batch_insitu_stats.unsqueeze(0).expand(B, -1)
+        batch_insitu_stats = torch.from_numpy(insitu_stats).float().to(device).unsqueeze(0).expand(B, -1)
 
-        batch_pred_ys = reverse_diffuse(
-            model, scheduler, batch_xs, batch_pos, batch_dates, INFERENCE_STEP_NUM,
-            device=device, insitu_stats=batch_insitu_stats  # type: ignore[arg-type]
-        )
-        batch_pred_ys = batch_pred_ys.reshape(-1)
-        # Denormalize
-        batch_pred_ys = dataset.denorm_y(batch_pred_ys)
-        # Clip
-        batch_pred_ys = torch.clamp(batch_pred_ys, SM_MIN, SM_MAX)
-        batch_pred_ys = batch_pred_ys.cpu().numpy()
+        batch_pred_ys = reverse_diffuse(model, scheduler, batch_xs, batch_pos, batch_dates, INFERENCE_STEP_NUM,
+                                        device=device, insitu_stats=batch_insitu_stats)
+        batch_pred_ys = dataset.denorm_y(batch_pred_ys.reshape(-1))
+        batch_pred_ys = torch.clamp(batch_pred_ys, SM_MIN, SM_MAX).cpu().numpy()
 
         pred_ys.append(batch_pred_ys)
         rows_list.append(batch_rows.numpy())
         cols_list.append(batch_cols.numpy())
 
-    pred_ys = np.concatenate(pred_ys)
-    rows = np.concatenate(rows_list)
-    cols = np.concatenate(cols_list)
-
-    # Direct assignment using row and col indices
-    pred_map[rows, cols] = pred_ys
-
+    pred_map[np.concatenate(rows_list), np.concatenate(cols_list)] = np.concatenate(pred_ys)
     return pred_map
 
 
