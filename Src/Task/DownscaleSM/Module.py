@@ -96,6 +96,24 @@ class SpatialEmbedding(nn.Module):
         return self.proj(torch.cat(emb_list, dim=1))
 
 
+class InsituStatsEmbedding(nn.Module):
+
+    def __init__(self, hidden_dim: int, stats_dim: int = 4):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.stats_dim = stats_dim
+        self.proj = nn.Sequential(
+            nn.Linear(stats_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+    def forward(self, insitu_stats: torch.Tensor) -> torch.Tensor:
+        return self.proj(insitu_stats)
+
+
 class FiLM(nn.Module):
 
     def __init__(self, hidden_dim: int):

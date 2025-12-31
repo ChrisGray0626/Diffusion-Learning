@@ -18,7 +18,7 @@ from torch.utils.data import Dataset, DataLoader
 from Constant import RANGE, CHECKPOINT_DIR_PATH, REF_GRID_36KM_PATH, RESOLUTION_36KM
 from Task.DownscaleSM.Dataset import TrainDataset, InsituStatsDataset, InsituDataset
 from Task.DownscaleSM.Evaluator import Evaluator
-from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, FiLMResBlock
+from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, InsituStatsEmbedding, FiLMResBlock
 from Util.ModelHelper import SinusoidalPosEmb, EarlyStopping
 from Util.TiffUtil import pos2grid_index
 from Util.Util import build_device
@@ -136,13 +136,10 @@ class NoisePredictor(ModelMixin, ConfigMixin):
             lat_max=lat_max
         )
 
-        # InSitu Stat
-        self.insitu_stats_embedding = nn.Sequential(
-            nn.Linear(4, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+        # Insitu Stats Embedding
+        self.insitu_stats_embedding = InsituStatsEmbedding(
+            hidden_dim=hidden_dim,
+            stats_dim=4
         )
 
         # Condition Fusion
@@ -169,7 +166,7 @@ class NoisePredictor(ModelMixin, ConfigMixin):
 
     def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
                 pos: torch.Tensor, dates: List[str],
-                insitu_stats: torch.Tensor = None) -> torch.Tensor:
+                insitu_stats: torch.Tensor) -> torch.Tensor:
         inputs = torch.cat([xs, diffused_ys], dim=1)
         x = self.input_layer(inputs)
 
@@ -183,12 +180,8 @@ class NoisePredictor(ModelMixin, ConfigMixin):
         # Embed Spatial
         embed_spatial = self.spatial_embedding(pos)
 
-        # Embed InSitu Stats
-        if insitu_stats is not None:
-            embed_insitu_stats = self.insitu_stats_embedding(insitu_stats)
-        else:
-            B = x.shape[0]
-            embed_insitu_stats = torch.zeros(B, self.hidden_dim, device=x.device, dtype=x.dtype)
+        # Embed Insitu Stats
+        embed_insitu_stats = self.insitu_stats_embedding(insitu_stats)
 
         # Fuse Condition
         condition = torch.cat([embed_timesteps, embed_time, embed_spatial, embed_insitu_stats], dim=1)
@@ -332,7 +325,7 @@ def build_early_stopping() -> EarlyStopping:
 def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
                     xs: torch.Tensor, pos: torch.Tensor, dates: List[str],
                     inference_step_num: int, device: str,
-                    insitu_stats: torch.Tensor = None) -> torch.Tensor:
+                    insitu_stats: torch.Tensor) -> torch.Tensor:
     model.eval()
     B = xs.shape[0]
 
