@@ -15,7 +15,7 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from Constant import RANGE, CHECKPOINT_DIR_PATH, REF_GRID_36KM_PATH, RESOLUTION_36KM
+from Constant import RANGE, CHECKPOINT_DIR_PATH, REF_GRID_36KM_PATH, RESOLUTION_36KM, RESULT_DIR_PATH
 from Task.DownscaleSM.Dataset import TrainDataset, InsituStatsDataset, InsituDataset
 from Task.DownscaleSM.Evaluator import Evaluator
 from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, InsituStatsEmbedding, FiLMResBlock
@@ -375,18 +375,26 @@ def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset,
     evaluator = Evaluator(min_site_num=2, min_date_num=2)
 
     # Evaluate by Date
-    df_result_date = evaluator.evaluate_by_date(pred_ys, insitus, insitu_masks, dates, true_ys=true_ys)
     print("\n" + "=" * 60)
     print("Evaluation by Date: Test Results vs InSitu Data")
     print("=" * 60)
+
+    df_result_date = evaluator.evaluate_by_date(pred_ys, insitus, insitu_masks, dates, true_ys=true_ys)
     evaluator.print_result(df_result_date)
 
+    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Date_Test.csv")
+    df_result_date.to_csv(dst_file_path, index=False)
+
     # Evaluate by Site
-    df_result_site = evaluator.evaluate_by_site(pred_ys, insitus, insitu_masks, dates, rows, cols, true_ys=true_ys)
     print("\n" + "=" * 60)
     print("Evaluation by Site: Test Results vs InSitu Data")
     print("=" * 60)
+
+    df_result_site = evaluator.evaluate_by_site(pred_ys, insitus, insitu_masks, dates, rows, cols, true_ys=true_ys)
     evaluator.print_result(df_result_site)
+
+    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Site_Test.csv")
+    df_result_site.to_csv(dst_file_path, index=False)
 
     # Evaluate by Spatial Distribution
     evaluator.evaluate_by_spatial_distribution(df_result_site, height=insitu_dataset.H, width=insitu_dataset.W)

@@ -5,16 +5,17 @@
 @Author Chris
 @Date 2025/12/12
 """
+import os
 
 import numpy as np
 from tqdm import tqdm
 
-from Constant import RESOLUTION_1KM
+from Constant import RESULT_DIR_PATH, RESOLUTION_36KM
 from Task.DownscaleSM.Dataset import InsituDataset, InferenceResultDataset
 from Task.DownscaleSM.Evaluator import Evaluator
 from Util.Util import get_valid_dates
 
-RESOLUTION = RESOLUTION_1KM
+RESOLUTION = RESOLUTION_36KM
 
 
 def main():
@@ -46,17 +47,21 @@ def main():
     rows = np.concatenate(all_rows)
     cols = np.concatenate(all_cols)
 
-    df_result_date = evaluator.evaluate_by_date(pred_ys, insitus, insitu_masks, all_dates)
     print("\n" + "=" * 60)
     print(f"Evaluation by Date: {RESOLUTION} Inference Results vs InSitu Data")
     print("=" * 60)
+    df_result_date = evaluator.evaluate_by_date(pred_ys, insitus, insitu_masks, all_dates)
     evaluator.print_result(df_result_date)
+    dst_file_path = os.path.join(RESULT_DIR_PATH, f"Evaluation_By_Date_{RESOLUTION}.csv")
+    df_result_date.to_csv(dst_file_path, index=False)
 
-    df_result_site = evaluator.evaluate_by_site(pred_ys, insitus, insitu_masks, all_dates, rows, cols)
     print("\n" + "=" * 60)
     print(f"Evaluation by Site: {RESOLUTION} Inference Results vs InSitu Data")
     print("=" * 60)
+    df_result_site = evaluator.evaluate_by_site(pred_ys, insitus, insitu_masks, all_dates, rows, cols)
     evaluator.print_result(df_result_site)
+    dst_file_path = os.path.join(RESULT_DIR_PATH, f"Evaluation_By_Site_{RESOLUTION}.csv")
+    df_result_site.to_csv(dst_file_path, index=False)
 
     evaluator.evaluate_by_spatial_distribution(df_result_site, height=insitu_dataset.H, width=insitu_dataset.W)
 

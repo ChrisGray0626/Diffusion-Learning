@@ -152,7 +152,10 @@ class Evaluator:
         ss_res = np.sum((true - pred) ** 2)
         ss_tot = np.sum((true - np.mean(true)) ** 2)
         r2 = 1 - (ss_res / ss_tot) if ss_tot > 1e-8 else (1.0 if ss_res < 1e-8 else np.nan)
-        return {'ubRMSE': ubrmse, 'Bias': bias, 'R2': r2 if np.isfinite(r2) else np.nan}
+        true_var = np.var(true)
+        slope = np.cov(pred, true)[0, 1] / true_var if true_var > 1e-8 else np.nan
+        return {'ubRMSE': ubrmse, 'Bias': bias, 'R2': r2 if np.isfinite(r2) else np.nan,
+                'Slope': slope if np.isfinite(slope) else np.nan}
 
     def evaluate_by_spatial_distribution(self, df_site_results: pd.DataFrame, height: int, width: int,
                                          figsize: tuple = (16, 6)):
