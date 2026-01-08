@@ -32,7 +32,7 @@ def main():
     print(f"Device: {device}")
     model = build_model()
     rf_corrector = BiasCorrector()
-    transform, crs, height, width = read_tiff_meta(REF_GRID_PATH)
+    transform, crs, _, _ = read_tiff_meta(REF_GRID_PATH)
     for date in tqdm(get_valid_dates()):
         dataset = InferenceDataset(date=date, resolution=RESOLUTION)
 
@@ -75,7 +75,7 @@ def inference(model: NoisePredictor, dataset: InferenceDataset, device: str) -> 
 
     pred_ys_list = []
     data_loader = DataLoader(dataset, batch_size=min(BATCH_SIZE, len(dataset)), shuffle=False)  # type: ignore[arg-type]
-    insitu_stats = torch.from_numpy(dataset.get_insitu_stats()).to(device).unsqueeze(0)
+    insitu_stats = torch.from_numpy(dataset.insitu_stats).to(device).unsqueeze(0)
     for batch_xs, batch_pos, batch_dates, batch_rows, batch_cols in tqdm(data_loader):
         batch_xs = batch_xs.to(device)
         batch_pos = batch_pos.to(device)

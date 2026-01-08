@@ -129,10 +129,13 @@ class InferenceDataset(Dataset):
         grid_info = self.grid_info_store.get()
         H, W = grid_info["H"], grid_info["W"]
 
+        # TODO Flatten?
         self.xs = xs.reshape(H * W, -1).astype(np.float32)
         self.pos = grid_info["pos"].reshape(H * W, -1).astype(np.float32)
         self.rows = grid_info["rows"].flatten()
         self.cols = grid_info["cols"].flatten()
+
+        self.insitu_stats = self.insitu_stats_store.get(self.date)
 
     def _filter_valid(self):
         valid = ~np.isnan(self.xs).any(axis=1)
@@ -150,15 +153,12 @@ class InferenceDataset(Dataset):
     def denorm_y(self, ys: torch.Tensor) -> torch.Tensor:
         return self.train_dataset.denorm_y(ys)
 
-    def get_insitu_stats(self) -> np.ndarray:
-        return self.insitu_stats_store.get(self.date)
-
     def __len__(self):
         return len(self.xs)
 
     def __getitem__(self, idx):
-        xs = torch.from_numpy(self.xs[idx]).float()
-        pos = torch.from_numpy(self.pos[idx]).float()
+        xs = self.xs[idx]
+        pos = self.pos[idx]
         date = self.date
         row = self.rows[idx]
         col = self.cols[idx]
@@ -248,35 +248,6 @@ class InsituDataset(Dataset):
             matched_insitus.append(insitu_map[indices[i]])
             matched_insitu_masks.append(insitu_mask[indices[i]])
         return np.array(matched_insitus), np.array(matched_insitu_masks)
-
-
-class InferenceResultDataset(Dataset):
-    def __init__(self, resolution: str):
-        self.resolution = resolution
-        self.inference_dir = os.path.join(INFERENCE_DIR_PATH, self.resolution)
-        ref_grid_path = REF_GRID_1KM_PATH if self.resolution == RESOLUTION_1KM else REF_GRID_36KM_PATH
-        _, lon_grid, lat_grid = read_tiff(ref_grid_path, dst_epsg_code=4326)
-        self.H, self.W = lon_grid.shape
-        rows, cols = np.meshgrid(np.arange(self.H, dtype=np.int32), np.arange(self.W, dtype=np.int32), indexing='ij')
-        self.rows_flat = rows.flatten()
-        self.cols_flat = cols.flatten()
-        self._cache = {}
-
-    def _load_date_data(self, date: str):
-        if date in self._cache:
-            return self._cache[date]
-        inference_tiff_path = os.path.join(self.inference_dir, f"{date}{TIFF_SUFFIX}")
-        if not os.path.exists(inference_tiff_path):
-            pred_map = np.full(self.H * self.W, np.nan, dtype=np.float32)
-        else:
-            pred_map = read_tiff_data(inference_tiff_path).astype(np.float32).flatten()
-        valid_mask = ~np.isnan(pred_map)
-        self._cache[date] = (pred_map, valid_mask)
-        return self._cache[date]
-
-    def get_data_by_date(self, date: str) -> tuple:
-        pred_map, pred_mask = self._load_date_data(date)
-        return pred_map, pred_mask, self.rows_flat, self.cols_flat
 
 
 class InferenceEvaluationDataset(Dataset):
