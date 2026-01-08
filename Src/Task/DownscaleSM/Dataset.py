@@ -5,8 +5,8 @@
   @Author Chris
   @Date 2025/11/12
 """
-
 from functools import cached_property
+from typing import Dict, Optional, Hashable, TypeVar, Generic, Callable
 
 import numpy as np
 import torch
@@ -17,6 +17,7 @@ from Util.TiffUtil import read_tiff, read_tiff_data
 from Util.Util import get_valid_dates
 
 
+# TODO TrainDataset with InsituStats
 class TrainDataset(Dataset):
 
     def __init__(self):
@@ -112,44 +113,26 @@ class InferenceDataset(Dataset):
     def __init__(self, date: str, resolution: str):
         self.date = date
         self.resolution = resolution
-        self._load_data()
-        self._filter_valid()
+        self.data_store = DataStore(resolution=self.resolution)
+        self.insitu_stats_store = InsituStatsStore(resolution=self.resolution)
+        self.grid_info_store = GridInfoStore(resolution=self.resolution)
+        self.data_names = [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME]
         self.train_dataset = TrainDataset()
 
+        self._load_data()
+        self._filter_valid()
+        self._norm()
+
     def _load_data(self):
-        # Load DEM data
-        dem_path = os.path.join(PROCESSED_DIR_PATH, DEM_NAME, self.resolution, f'{DEM_NAME}{TIFF_SUFFIX}')
-        dem_data = read_tiff_data(dem_path).astype(np.float32)
+        xs = np.stack([self.data_store.get(name, self.date) for name in self.data_names], axis=-1)
 
-        data_dict = {}
-        for data_type in [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME]:
-            file_path = os.path.join(PROCESSED_DIR_PATH, data_type, self.resolution, f'{self.date}{TIFF_SUFFIX}')
-            data_dict[data_type] = read_tiff_data(file_path).astype(np.float32)
+        grid_info = self.grid_info_store.get()
+        H, W = grid_info["H"], grid_info["W"]
 
-        xs_date = np.stack([
-            data_dict[NDVI_NAME],
-            data_dict[LST_NAME],
-            data_dict[ALBEDO_NAME],
-            data_dict[PRECIPITATION_NAME],
-            dem_data,
-        ], axis=-1)  # [H, W, C]
-
-        H, W = xs_date.shape[:2]
-        self.xs = xs_date.reshape(H * W, -1).astype(np.float32)
-
-        # Load & Reshape position data
-        if self.resolution == RESOLUTION_1KM:
-            ref_grid_path = REF_GRID_1KM_PATH
-        else:
-            ref_grid_path = REF_GRID_36KM_PATH
-        _, grid_lon, grid_lat = read_tiff(ref_grid_path, dst_epsg_code=4326)
-        pos_grid = np.stack([grid_lon, grid_lat], axis=-1).astype(np.float32)
-        self.pos = pos_grid.reshape(H * W, -1).astype(np.float32)
-
-        # Row & Col Index
-        rows, cols = np.meshgrid(np.arange(H, dtype=np.int32), np.arange(W, dtype=np.int32), indexing='ij')
-        self.rows = rows.flatten()
-        self.cols = cols.flatten()
+        self.xs = xs.reshape(H * W, -1).astype(np.float32)
+        self.pos = grid_info["pos"].reshape(H * W, -1).astype(np.float32)
+        self.rows = grid_info["rows"].flatten()
+        self.cols = grid_info["cols"].flatten()
 
     def _filter_valid(self):
         valid = ~np.isnan(self.xs).any(axis=1)
@@ -159,14 +142,16 @@ class InferenceDataset(Dataset):
         self.rows = self.rows[valid]
         self.cols = self.cols[valid]
 
-    def norm_x(self, xs: torch.Tensor) -> torch.Tensor:
-        x_mean = torch.tensor(self.train_dataset.x_mean, dtype=xs.dtype, device=xs.device)
-        x_std = torch.tensor(self.train_dataset.x_std, dtype=xs.dtype, device=xs.device)
-
-        return (xs - x_mean) / x_std
+    def _norm(self):
+        x_mean = self.train_dataset.x_mean
+        x_std = self.train_dataset.x_std
+        self.xs = (self.xs - x_mean) / x_std
 
     def denorm_y(self, ys: torch.Tensor) -> torch.Tensor:
         return self.train_dataset.denorm_y(ys)
+
+    def get_insitu_stats(self) -> np.ndarray:
+        return self.insitu_stats_store.get(self.date)
 
     def __len__(self):
         return len(self.xs)
@@ -185,7 +170,6 @@ class InsituStatsDataset:
     def __init__(self, resolution: str = RESOLUTION_36KM):
         self.resolution = resolution
         self._load_data()
-        self._norm()
 
     def _load_data(self):
         insitu_dir = os.path.join(PROCESSED_DIR_PATH, IN_SITU_NAME, self.resolution)
@@ -217,12 +201,6 @@ class InsituStatsDataset:
         else:
             raw_stats = np.zeros(4, dtype=np.float32)
         return raw_stats
-
-    def _norm(self):
-        stats_mean = self.insitu_stats.mean(axis=0)
-        stats_std = self.insitu_stats.std(axis=0)
-        stats_std[stats_std == 0] = 1.0
-        self.insitu_stats = (self.insitu_stats - stats_mean) / stats_std
 
     def get_stats(self, date: str) -> np.ndarray:
         date_idx = np.where(self.dates == date)[0]
@@ -299,3 +277,112 @@ class InferenceResultDataset(Dataset):
     def get_data_by_date(self, date: str) -> tuple:
         pred_map, pred_mask = self._load_date_data(date)
         return pred_map, pred_mask, self.rows_flat, self.cols_flat
+
+
+T = TypeVar("T")
+
+
+class BaseDataStore(Generic[T]):
+
+    def __init__(self):
+        self._cache: Dict[Hashable, T] = {}
+
+    def _get(self, key: Hashable, loader: Callable[[], T], cache_used: bool = True) -> T:
+        if cache_used and key in self._cache:
+            return self._cache[key]
+
+        data = loader()
+
+        if cache_used:
+            self._cache[key] = data
+
+        return data
+
+    def clear_cache(self) -> None:
+        self._cache.clear()
+
+
+class DataStore(BaseDataStore[np.ndarray]):
+
+    def __init__(self, resolution: str):
+        super().__init__()
+        self.resolution = resolution
+
+    def get(self, name: str, date: Optional[str] = None, cache_used: bool = True) -> np.ndarray:
+        key = (name, date, self.resolution)
+        return self._get(key, lambda: self._load(name, date), cache_used=cache_used)
+
+    def _load(self, name: str, date: Optional[str]) -> np.ndarray:
+        file_path = self._build_path(name, date)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        data = read_tiff_data(file_path).astype(np.float32)
+
+        return data
+
+    def _build_path(self, name: str, date: Optional[str]) -> str:
+        if name == DEM_NAME:
+            return os.path.join(PROCESSED_DIR_PATH, name, self.resolution, f"{name}{TIFF_SUFFIX}")
+        return os.path.join(PROCESSED_DIR_PATH, name, self.resolution, f"{date}{TIFF_SUFFIX}")
+
+
+class InsituStatsStore(BaseDataStore[np.ndarray]):
+
+    def __init__(self, resolution: str):
+        super().__init__()
+        self.resolution = resolution
+        self.data_store = DataStore(resolution=self.resolution)
+
+    def get(self, date: str, cache_used: bool = True) -> np.ndarray:
+        return self._get(date, lambda: self._load(date), cache_used=cache_used)
+
+    def _load(self, date: str) -> np.ndarray:
+        insitus = self.data_store.get(IN_SITU_NAME, date)
+
+        return self._calc_insitu_stats_from_data(insitus)
+
+    @staticmethod
+    def _calc_insitu_stats_from_data(insitus: np.ndarray) -> np.ndarray:
+        valid_insitu = insitus[~np.isnan(insitus)]
+        if len(valid_insitu) > 0:
+            insitu_stats = np.array([
+                np.mean(valid_insitu),
+                np.std(valid_insitu),
+                np.percentile(valid_insitu, 25),
+                np.percentile(valid_insitu, 75),
+            ], dtype=np.float32)
+        else:
+            insitu_stats = np.zeros(4, dtype=np.float32)
+        return insitu_stats
+
+
+class GridInfoStore(BaseDataStore[Dict]):
+
+    def __init__(self, resolution: str):
+        super().__init__()
+        self.resolution = resolution
+
+    def get(self, cache_used: bool = True) -> Dict:
+        key = self.resolution
+        return self._get(key, lambda: self._load(), cache_used=cache_used)
+
+    def _load(self) -> Dict:
+        if self.resolution == RESOLUTION_1KM:
+            ref_path = REF_GRID_1KM_PATH
+        else:
+            ref_path = REF_GRID_36KM_PATH
+
+        _, lons, lats = read_tiff(ref_path, dst_epsg_code=4326)
+        H, W = lons.shape
+        rows, cols = np.meshgrid(np.arange(H, dtype=np.int32),
+                                 np.arange(W, dtype=np.int32), indexing="ij")
+        grid_info = {
+            "lons": lons,
+            "lats": lats,
+            "rows": rows,
+            "cols": cols,
+            "H": H,
+            "W": W,
+            "pos": np.stack([lons, lats], axis=-1).astype(np.float32),
+        }
+        return grid_info

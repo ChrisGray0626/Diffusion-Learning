@@ -8,11 +8,12 @@
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from Constant import *
-from Task.DownscaleSM.Dataset import InferenceDataset, InsituStatsDataset
+from Task.DownscaleSM.Dataset import InferenceDataset, GridInfoStore
+from Task.DownscaleSM.Module import BiasCorrector
 from Task.DownscaleSM.Trainer import NoisePredictor, build_scheduler, reverse_diffuse
 from Util.TiffUtil import write_tiff, read_tiff_meta
 from Util.Util import get_valid_dates, build_device
@@ -29,22 +30,30 @@ REF_GRID_PATH = REF_GRID_1KM_PATH if RESOLUTION == RESOLUTION_1KM else REF_GRID_
 def main():
     device = build_device()
     print(f"Device: {device}")
-
-    insitu_stats_dataset = InsituStatsDataset(resolution=RESOLUTION)
+    model = build_model()
+    rf_corrector = BiasCorrector()
     transform, crs, height, width = read_tiff_meta(REF_GRID_PATH)
-    dates = get_valid_dates()
-    for date in tqdm(dates):
+    for date in tqdm(get_valid_dates()):
         dataset = InferenceDataset(date=date, resolution=RESOLUTION)
-        insitu_stats = insitu_stats_dataset.get_stats(date)
 
-        pred_map = inference(
-            dataset=dataset,
-            height=height,
-            width=width,
-            insitu_stats=insitu_stats,
-            device=device,
+        # Inference
+        pred_ys = inference(model=model, dataset=dataset, device=device)
+
+        # Correction
+        pred_ys = rf_corrector.predict(
+            pred_ys=pred_ys,
+            aux_feats=dataset.xs
         )
 
+        # Clip
+        pred_ys = np.clip(pred_ys, SM_MIN, SM_MAX)
+
+        # Convert to map
+        grid_info = GridInfoStore(RESOLUTION).get()
+        pred_map = np.full((grid_info["H"], grid_info["W"]), np.nan, dtype=np.float32)
+        pred_map[dataset.rows, dataset.cols] = pred_ys
+
+        # Write TIFF
         dst_dir_path = os.path.join(INFERENCE_DIR_PATH, RESOLUTION)
         os.makedirs(dst_dir_path, exist_ok=True)
         dst_file_path = os.path.join(dst_dir_path, f"{date}{TIFF_SUFFIX}")
@@ -59,32 +68,29 @@ def build_model() -> NoisePredictor:
 
 
 @torch.no_grad()
-def inference(dataset: Dataset, height: int, width: int, insitu_stats: np.ndarray, device: str) -> np.ndarray:
-    model = build_model().to(device)
+def inference(model: NoisePredictor, dataset: InferenceDataset, device: str) -> np.ndarray:
+    model = model.to(device)
     scheduler = build_scheduler()
     model.eval()
 
+    pred_ys_list = []
     data_loader = DataLoader(dataset, batch_size=min(BATCH_SIZE, len(dataset)), shuffle=False)  # type: ignore[arg-type]
-    pred_map = np.full((height, width), np.nan, dtype=np.float32)
-    pred_ys, rows_list, cols_list = [], [], []
-
+    insitu_stats = torch.from_numpy(dataset.get_insitu_stats()).to(device).unsqueeze(0)
     for batch_xs, batch_pos, batch_dates, batch_rows, batch_cols in tqdm(data_loader):
-        batch_xs = dataset.norm_x(batch_xs.to(device))
+        batch_xs = batch_xs.to(device)
         batch_pos = batch_pos.to(device)
         B = batch_xs.shape[0]
-        batch_insitu_stats = torch.from_numpy(insitu_stats).float().to(device).unsqueeze(0).expand(B, -1)
+        batch_insitu_stats = insitu_stats.expand(B, -1)
 
         batch_pred_ys = reverse_diffuse(model, scheduler, batch_xs, batch_pos, batch_dates, INFERENCE_STEP_NUM,
                                         device=device, insitu_stats=batch_insitu_stats)
         batch_pred_ys = dataset.denorm_y(batch_pred_ys.reshape(-1))
-        batch_pred_ys = torch.clamp(batch_pred_ys, SM_MIN, SM_MAX).cpu().numpy()
+        batch_pred_ys = batch_pred_ys.cpu().numpy()
 
-        pred_ys.append(batch_pred_ys)
-        rows_list.append(batch_rows.numpy())
-        cols_list.append(batch_cols.numpy())
+        pred_ys_list.append(batch_pred_ys)
 
-    pred_map[np.concatenate(rows_list), np.concatenate(cols_list)] = np.concatenate(pred_ys)
-    return pred_map
+    pred_ys = np.concatenate(pred_ys_list)
+    return pred_ys
 
 
 if __name__ == "__main__":

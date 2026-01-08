@@ -5,11 +5,19 @@
   @Author Chris
   @Date 2025/11/12
 """
+import os
 from datetime import datetime
 from typing import List
 
+import joblib
+import numpy as np
 import torch
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
 from torch import nn
+
+from Constant import CHECKPOINT_DIR_PATH
 
 
 class TimeEmbedding(nn.Module):
@@ -160,3 +168,72 @@ class FiLMResBlock(nn.Module):
         out = x + self.net(x_modulated)
 
         return out
+
+
+class BiasCorrector:
+
+    def __init__(self, model_name: str = "rf_bias_corrector", n_estimators: int = 300, max_depth: int = None,
+                 max_features: int = 4, random_state: int = 42):
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        self.max_features = max_features
+        self.random_state = random_state
+        self.model = None
+        self.model_dir = os.path.join(CHECKPOINT_DIR_PATH, "DownscaleSM", "RF")
+        self.model_path = os.path.join(self.model_dir, f"{model_name}.joblib")
+
+        if os.path.exists(self.model_path):
+            self.load()
+
+    def train(self, pred_ys: np.ndarray, insitus: np.ndarray, insitu_masks: np.ndarray,
+              aux_feats: np.ndarray):
+        valid_mask = insitu_masks > 0
+        pred_ys = pred_ys[valid_mask]
+        insitus = insitus[valid_mask]
+        aux_feats = aux_feats[valid_mask]
+
+        X = np.column_stack([pred_ys, aux_feats]).astype(np.float32)
+        y = insitus.astype(np.float32)
+
+        # 划分训练集和验证集
+        x_train, x_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=self.random_state
+        )
+
+        # 训练随机森林模型
+        self.model = RandomForestRegressor(
+            n_estimators=self.n_estimators,
+            max_depth=self.max_depth,
+            max_features=self.max_features,
+            n_jobs=-1,
+            random_state=self.random_state,
+            oob_score=True
+        )
+        self.model.fit(x_train, y_train)
+
+        y_pred_val = self.model.predict(x_val)
+        mse = mean_squared_error(y_val, y_pred_val)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_val, y_pred_val)
+
+        print(f"\nRF Bias Corrector Training:")
+        print(f"  Training samples: {len(x_train):,}, Validation samples: {len(x_val):,}")
+        print(f"  Validation RMSE: {rmse:.6f}, R2: {r2:.4f}")
+        print(f"  OOB Score: {self.model.oob_score_:.4f}")
+
+        # Save Model
+        os.makedirs(self.model_dir, exist_ok=True)
+        joblib.dump(self.model, self.model_path)
+
+        return self.model
+
+    def load(self):
+        if not os.path.exists(self.model_path):
+            raise FileNotFoundError(f"RF bias corrector model not found: {self.model_path}")
+
+        self.model = joblib.load(self.model_path)
+        return self.model
+
+    def predict(self, pred_ys: np.ndarray, aux_feats: np.ndarray) -> np.ndarray:
+        X = np.column_stack([pred_ys, aux_feats]).astype(np.float32)
+        return self.model.predict(X).astype(np.float32)

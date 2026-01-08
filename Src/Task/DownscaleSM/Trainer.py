@@ -5,9 +5,9 @@
   @Author Chris
   @Date 2025/11/12
 """
-import os
 from typing import List
 
+import numpy as np
 import torch
 import torch.nn as nn
 from diffusers import DDPMScheduler
@@ -15,10 +15,11 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
-from Constant import RANGE, CHECKPOINT_DIR_PATH, REF_GRID_36KM_PATH, RESOLUTION_36KM, RESULT_DIR_PATH
-from Task.DownscaleSM.Dataset import TrainDataset, InsituStatsDataset, InsituDataset
+from Constant import *
+from Task.DownscaleSM.Dataset import TrainDataset, InsituStatsDataset, InsituDataset, GridInfoStore
 from Task.DownscaleSM.Evaluator import Evaluator
-from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, InsituStatsEmbedding, FiLMResBlock
+from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, InsituStatsEmbedding, FiLMResBlock, \
+    BiasCorrector
 from Util.ModelHelper import SinusoidalPosEmb, EarlyStopping
 from Util.TiffUtil import pos2grid_index
 from Util.Util import build_device
@@ -51,7 +52,7 @@ SM_MIN = 0.02
 SM_MAX = 0.5
 
 # Control Flag
-TRAINING = True
+TRAINING = False
 TEST = True
 
 
@@ -361,43 +362,77 @@ def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset,
             insitu_stats=insitu_stats
         )
 
-    # Denormalize & Clip
+    # Denormalize
     pred_ys = dataset.dataset.denorm_y(pred_ys)
-    pred_ys = torch.clamp(pred_ys, SM_MIN, SM_MAX)
     pred_ys = pred_ys.cpu().numpy()
     true_ys = dataset.dataset.denorm_y(true_ys)
     true_ys = true_ys.numpy()
 
-    # Evaluate
-    insitu_dataset = InsituDataset(resolution=RESOLUTION_36KM)
+    # TODO Get InSitu Data
+    grid_info_store = GridInfoStore(resolution=RESOLUTION_36KM)
     rows, cols = pos2grid_index(pos.cpu().numpy(), REF_GRID_36KM_PATH)
-    insitus, insitu_masks = insitu_dataset.get_data_by_date_row_col(dates, rows, cols)
+    insitu_dataset = InsituDataset(resolution=RESOLUTION_36KM)
+    insitus, insitu_masks = insitu_dataset.get_data_by_date_row_col(list(dates), rows.flatten(), cols.flatten())
+
+    # RF Bias Corrector
+    rf_corrector = BiasCorrector()
+    xs = xs.cpu().numpy()
+    rf_corrector.train(
+        pred_ys=pred_ys,
+        insitus=insitus.flatten(),
+        insitu_masks=insitu_masks.flatten(),
+        aux_feats=xs
+    )
+    # Bias correction
+    pred_ys_corrected = rf_corrector.predict(
+        pred_ys=pred_ys,
+        aux_feats=xs
+    )
+    pred_ys_corrected = np.clip(pred_ys_corrected, SM_MIN, SM_MAX)
+
+    # Evaluate
     evaluator = Evaluator(min_site_num=2, min_date_num=2)
 
-    # Evaluate by Date
+    # Evaluate original predictions
     print("\n" + "=" * 60)
-    print("Evaluation by Date: Test Results vs InSitu Data")
+    print("Evaluation by Date: Original Predictions vs InSitu Data")
     print("=" * 60)
 
-    df_result_date = evaluator.evaluate_by_date(pred_ys, insitus, insitu_masks, dates, true_ys=true_ys)
-    evaluator.print_result(df_result_date)
+    df_result_date_orig = evaluator.evaluate_by_date(pred_ys, insitus, insitu_masks, dates, true_ys=true_ys)
+    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Date_Test_Original.csv")
+    df_result_date_orig.to_csv(dst_file_path, index=False)
 
-    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Date_Test.csv")
-    df_result_date.to_csv(dst_file_path, index=False)
-
-    # Evaluate by Site
+    # Evaluate corrected predictions
     print("\n" + "=" * 60)
-    print("Evaluation by Site: Test Results vs InSitu Data")
+    print("Evaluation by Date: Corrected Predictions vs InSitu Data")
     print("=" * 60)
 
-    df_result_site = evaluator.evaluate_by_site(pred_ys, insitus, insitu_masks, dates, rows, cols, true_ys=true_ys)
-    evaluator.print_result(df_result_site)
+    df_result_date_corr = evaluator.evaluate_by_date(pred_ys_corrected, insitus, insitu_masks, dates, true_ys=true_ys)
+    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Date_Test_Corrected.csv")
+    df_result_date_corr.to_csv(dst_file_path, index=False)
 
-    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Site_Test.csv")
-    df_result_site.to_csv(dst_file_path, index=False)
+    # Evaluate by Site - Original
+    print("\n" + "=" * 60)
+    print("Evaluation by Site: Original Predictions vs InSitu Data")
+    print("=" * 60)
+
+    df_result_site_orig = evaluator.evaluate_by_site(pred_ys, insitus, insitu_masks, dates, rows, cols, true_ys=true_ys)
+    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Site_Test_Original.csv")
+    df_result_site_orig.to_csv(dst_file_path, index=False)
+
+    # Evaluate by Site - Corrected
+    print("\n" + "=" * 60)
+    print("Evaluation by Site: Corrected Predictions vs InSitu Data")
+    print("=" * 60)
+
+    df_result_site_corr = evaluator.evaluate_by_site(pred_ys_corrected, insitus, insitu_masks, dates, rows, cols,
+                                                     true_ys=true_ys)
+    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Site_Test_Corrected.csv")
+    df_result_site_corr.to_csv(dst_file_path, index=False)
 
     # Evaluate by Spatial Distribution
-    evaluator.evaluate_by_spatial_distribution(df_result_site, height=insitu_dataset.H, width=insitu_dataset.W)
+    grid_info = grid_info_store.get()
+    evaluator.evaluate_by_spatial_distribution(df_result_site_corr, height=grid_info['H'], width=grid_info['W'])
 
 
 if __name__ == "__main__":
