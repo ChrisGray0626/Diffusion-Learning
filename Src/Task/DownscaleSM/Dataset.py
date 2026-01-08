@@ -279,6 +279,52 @@ class InferenceResultDataset(Dataset):
         return pred_map, pred_mask, self.rows_flat, self.cols_flat
 
 
+class InferenceEvaluationDataset(Dataset):
+
+    def __init__(self, resolution: str):
+        self.resolution = resolution
+        self.inference_result_store = InferenceResultStore(resolution=self.resolution)
+        self.data_store = DataStore(resolution=self.resolution)
+        self.grid_info_store = GridInfoStore(resolution=self.resolution)
+
+        grid_info = self.grid_info_store.get()
+        self.H, self.W = grid_info["H"], grid_info["W"]
+        self.rows = grid_info["rows"]
+        self.cols = grid_info["cols"]
+
+    def get(self, date: str) -> tuple:
+        pred_map = self.inference_result_store.get(date)
+        insitu_map = self.data_store.get(IN_SITU_NAME, date)
+
+        pred_mask = (~np.isnan(pred_map)).astype(np.float32)
+        insitu_mask = (~np.isnan(insitu_map)).astype(np.float32)
+        valid_masks = (pred_mask > 0) & (insitu_mask > 0)
+
+        return pred_map, insitu_map, valid_masks, self.rows, self.cols
+
+    def get_all(self) -> tuple:
+        dates = get_valid_dates()
+        all_pred_map, all_insitus_map, all_valid_masks, all_rows, all_cols, all_dates = [], [], [], [], [], []
+
+        for date in dates:
+            pred_map, insitus_map, valid_masks, rows, cols = self.get(date)
+
+            all_pred_map.append(pred_map)
+            all_insitus_map.append(insitus_map)
+            all_valid_masks.append(valid_masks)
+            all_rows.append(rows)
+            all_cols.append(cols)
+            all_dates.extend([date] * self.H * self.W)
+
+        pred_map = np.concatenate(all_pred_map)
+        insitus_map = np.concatenate(all_insitus_map)
+        valid_masks = np.concatenate(all_valid_masks)
+        rows = np.concatenate(all_rows)
+        cols = np.concatenate(all_cols)
+
+        return pred_map, insitus_map, valid_masks, all_dates, rows, cols
+
+
 T = TypeVar("T")
 
 
@@ -302,32 +348,8 @@ class BaseDataStore(Generic[T]):
         self._cache.clear()
 
 
-class DataStore(BaseDataStore[np.ndarray]):
-
-    def __init__(self, resolution: str):
-        super().__init__()
-        self.resolution = resolution
-
-    def get(self, name: str, date: Optional[str] = None, cache_used: bool = True) -> np.ndarray:
-        key = (name, date, self.resolution)
-        return self._get(key, lambda: self._load(name, date), cache_used=cache_used)
-
-    def _load(self, name: str, date: Optional[str]) -> np.ndarray:
-        file_path = self._build_path(name, date)
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File not found: {file_path}")
-        data = read_tiff_data(file_path).astype(np.float32)
-
-        return data
-
-    def _build_path(self, name: str, date: Optional[str]) -> str:
-        if name == DEM_NAME:
-            return os.path.join(PROCESSED_DIR_PATH, name, self.resolution, f"{name}{TIFF_SUFFIX}")
-        return os.path.join(PROCESSED_DIR_PATH, name, self.resolution, f"{date}{TIFF_SUFFIX}")
-
-
 class InsituStatsStore(BaseDataStore[np.ndarray]):
-
+    # TODO resolution
     def __init__(self, resolution: str):
         super().__init__()
         self.resolution = resolution
@@ -354,6 +376,52 @@ class InsituStatsStore(BaseDataStore[np.ndarray]):
         else:
             insitu_stats = np.zeros(4, dtype=np.float32)
         return insitu_stats
+
+
+class InferenceResultStore(BaseDataStore[np.ndarray]):
+
+    def __init__(self, resolution: str):
+        super().__init__()
+        self.resolution = resolution
+
+    def get(self, date: Optional[str] = None, cache_used: bool = True) -> np.ndarray:
+        key = (date, self.resolution)
+        return self._get(key, lambda: self._load(date), cache_used=cache_used)
+
+    def _load(self, date: str) -> np.ndarray:
+        file_path = self._build_path(date)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        data = read_tiff_data(file_path).astype(np.float32)
+
+        return data
+
+    def _build_path(self, date: str) -> str:
+        return os.path.join(INFERENCE_DIR_PATH, self.resolution, f"{date}{TIFF_SUFFIX}")
+
+
+class DataStore(BaseDataStore[np.ndarray]):
+
+    def __init__(self, resolution: str):
+        super().__init__()
+        self.resolution = resolution
+
+    def get(self, name: str, date: Optional[str] = None, cache_used: bool = True) -> np.ndarray:
+        key = (name, date, self.resolution)
+        return self._get(key, lambda: self._load(name, date), cache_used=cache_used)
+
+    def _load(self, name: str, date: Optional[str]) -> np.ndarray:
+        file_path = self._build_path(name, date)
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"File not found: {file_path}")
+        data = read_tiff_data(file_path).astype(np.float32)
+
+        return data
+
+    def _build_path(self, name: str, date: Optional[str]) -> str:
+        if name == DEM_NAME:
+            return os.path.join(PROCESSED_DIR_PATH, name, self.resolution, f"{name}{TIFF_SUFFIX}")
+        return os.path.join(PROCESSED_DIR_PATH, name, self.resolution, f"{date}{TIFF_SUFFIX}")
 
 
 class GridInfoStore(BaseDataStore[Dict]):
