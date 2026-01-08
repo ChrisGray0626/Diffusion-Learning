@@ -5,7 +5,6 @@
   @Author Chris
   @Date 2025/11/12
 """
-from functools import cached_property
 from typing import Dict, Optional, Hashable, TypeVar, Generic, Callable
 
 import numpy as np
@@ -17,38 +16,30 @@ from Util.TiffUtil import read_tiff, read_tiff_data
 from Util.Util import get_valid_dates
 
 
-# TODO TrainDataset with InsituStats
 class TrainDataset(Dataset):
 
-    def __init__(self):
+    def __init__(self, resolution: str = RESOLUTION_36KM):
+        self.resolution = resolution
+        self.data_store = DataStore(resolution=self.resolution)
+        self.grid_info_store = GridInfoStore(resolution=self.resolution)
+        self.data_names = [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME]
         self._load_data()
         self._filter_valid()
         self._norm()
 
     def _load_data(self):
-        # Load DEM data
-        dem_path = os.path.join(PROCESSED_DIR_PATH, DEM_NAME, RESOLUTION_36KM, f'{DEM_NAME}{TIFF_SUFFIX}')
-        dem_data = read_tiff_data(dem_path).astype(np.float32)
-
-        # Load multi-date data
         dates = get_valid_dates()
         self.dates = np.array(dates, dtype=object)
-        xs_list = []
-        ys_list = []
-        for date in dates:
-            data_dict = {}
-            for data_type in [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, SM_NAME]:
-                file_path = os.path.join(PROCESSED_DIR_PATH, data_type, RESOLUTION_36KM, f'{date}{TIFF_SUFFIX}')
-                data_dict[data_type] = read_tiff_data(file_path).astype(np.float32)
 
+        grid_info = self.grid_info_store.get()
+
+        xs_list, ys_list = [], []
+
+        for date in dates:
             xs_date = np.stack([
-                data_dict[NDVI_NAME],
-                data_dict[LST_NAME],
-                data_dict[ALBEDO_NAME],
-                data_dict[PRECIPITATION_NAME],
-                dem_data,
+                self.data_store.get(name, date) for name in self.data_names
             ], axis=-1)
-            ys_date = data_dict[SM_NAME][:, :, np.newaxis]
+            ys_date = self.data_store.get(SM_NAME, date)[:, :, np.newaxis]
 
             xs_list.append(xs_date)
             ys_list.append(ys_date)
@@ -56,14 +47,13 @@ class TrainDataset(Dataset):
         xs = np.array(xs_list, dtype=np.float32)
         ys = np.array(ys_list, dtype=np.float32)
 
-        # Reshape X & Y data
-        date_num, H, W = xs.shape[:3]
+        date_num = len(dates)
+        H = grid_info["H"]
+        W = grid_info["W"]
         self.xs = xs.reshape(date_num * H * W, -1).astype(np.float32)
         self.ys = ys.reshape(date_num * H * W, -1).astype(np.float32)
 
-        # Load & Reshape position data
-        _, lon_grid, lat_grid = read_tiff(REF_GRID_36KM_PATH, dst_epsg_code=4326)
-        pos_grid = np.stack([lon_grid, lat_grid], axis=-1).astype(np.float32)
+        pos_grid = grid_info["pos"]
         pos_expanded = np.tile(pos_grid[np.newaxis, :, :, :], (date_num, 1, 1, 1))
         self.pos = pos_expanded.reshape(date_num * H * W, -1).astype(np.float32)
 
@@ -129,7 +119,6 @@ class InferenceDataset(Dataset):
         grid_info = self.grid_info_store.get()
         H, W = grid_info["H"], grid_info["W"]
 
-        # TODO Flatten?
         self.xs = xs.reshape(H * W, -1).astype(np.float32)
         self.pos = grid_info["pos"].reshape(H * W, -1).astype(np.float32)
         self.rows = grid_info["rows"].flatten()
@@ -164,53 +153,6 @@ class InferenceDataset(Dataset):
         col = self.cols[idx]
 
         return xs, pos, date, row, col
-
-
-class InsituStatsDataset:
-    def __init__(self, resolution: str = RESOLUTION_36KM):
-        self.resolution = resolution
-        self._load_data()
-
-    def _load_data(self):
-        insitu_dir = os.path.join(PROCESSED_DIR_PATH, IN_SITU_NAME, self.resolution)
-        self.dates = np.array(get_valid_dates(), dtype=str)
-
-        insitu_stats_list = []
-        for date in self.dates:
-            insitu_path = os.path.join(insitu_dir, f'{date}{TIFF_SUFFIX}')
-            if not os.path.exists(insitu_path):
-                insitu_stats_list.append(np.zeros(4, dtype=np.float32))
-                continue
-
-            insitu_data = read_tiff_data(insitu_path).astype(np.float32)
-            raw_stats = self._calc_insitu_stats_from_data(insitu_data)
-            insitu_stats_list.append(raw_stats)
-
-        self.insitu_stats = np.array(insitu_stats_list, dtype=np.float32)
-
-    @staticmethod
-    def _calc_insitu_stats_from_data(insitu_data: np.ndarray) -> np.ndarray:
-        valid_insitu = insitu_data[~np.isnan(insitu_data)]
-        if len(valid_insitu) > 0:
-            raw_stats = np.array([
-                np.mean(valid_insitu),
-                np.std(valid_insitu),
-                np.percentile(valid_insitu, 25),
-                np.percentile(valid_insitu, 75),
-            ], dtype=np.float32)
-        else:
-            raw_stats = np.zeros(4, dtype=np.float32)
-        return raw_stats
-
-    def get_stats(self, date: str) -> np.ndarray:
-        date_idx = np.where(self.dates == date)[0]
-        if len(date_idx) == 0:
-            return np.zeros(4, dtype=np.float32)
-        return self.insitu_stats[date_idx[0]]
-
-    @cached_property
-    def stats_dict(self) -> dict:
-        return {str(date): self.insitu_stats[i] for i, date in enumerate(self.dates)}
 
 
 class InsituDataset(Dataset):
@@ -250,6 +192,7 @@ class InsituDataset(Dataset):
         return np.array(matched_insitus), np.array(matched_insitu_masks)
 
 
+# TODO 只评估实际参与训练的点
 class InferenceEvaluationDataset(Dataset):
 
     def __init__(self, resolution: str):
@@ -296,6 +239,71 @@ class InferenceEvaluationDataset(Dataset):
         return pred_map, insitus_map, valid_masks, all_dates, rows, cols
 
 
+class DataCoverageDataset(Dataset):
+
+    def __init__(self, resolution: str):
+        self.resolution = resolution
+        self.data_store = DataStore(resolution=self.resolution)
+        self.grid_info_store = GridInfoStore(resolution=self.resolution)
+
+        grid_info = self.grid_info_store.get()
+        self.H, self.W = grid_info["H"], grid_info["W"]
+        self.rows = grid_info["rows"]
+        self.cols = grid_info["cols"]
+        self.feature_names = [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME, SM_NAME, IN_SITU_NAME]
+
+    def get(self, date: str) -> tuple:
+        features = {}
+        for name in self.feature_names:
+            try:
+                if name == DEM_NAME:
+                    features[name] = self.data_store.get(name, None)
+                else:
+                    features[name] = self.data_store.get(name, date)
+            except FileNotFoundError:
+                features[name] = np.full((self.H, self.W), np.nan, dtype=np.float32)
+
+        train_valid = ~np.isnan(features[NDVI_NAME]) & ~np.isnan(features[LST_NAME]) & \
+                      ~np.isnan(features[ALBEDO_NAME]) & ~np.isnan(features[PRECIPITATION_NAME]) & \
+                      ~np.isnan(features[DEM_NAME]) & ~np.isnan(features[SM_NAME])
+        insitu_valid = ~np.isnan(features[IN_SITU_NAME])
+
+        all_positions_mask = train_valid | insitu_valid
+
+        rows = self.rows[all_positions_mask]
+        cols = self.cols[all_positions_mask]
+        feature_values = {name: features[name][all_positions_mask] for name in self.feature_names}
+        train_valid_mask = train_valid[all_positions_mask]
+        insitu_valid_mask = insitu_valid[all_positions_mask]
+
+        return rows, cols, feature_values, train_valid_mask, insitu_valid_mask
+
+    def get_all(self) -> tuple:
+        dates = get_valid_dates()
+        all_rows, all_cols, all_dates = [], [], []
+        all_feature_values = {name: [] for name in self.feature_names}
+        all_train_valid, all_insitu_valid = [], []
+
+        for date in dates:
+            rows, cols, feature_values, train_valid, insitu_valid = self.get(date)
+
+            all_rows.append(rows)
+            all_cols.append(cols)
+            all_dates.extend([date] * len(rows))
+            for name in self.feature_names:
+                all_feature_values[name].append(feature_values[name])
+            all_train_valid.append(train_valid)
+            all_insitu_valid.append(insitu_valid)
+
+        rows = np.concatenate(all_rows)
+        cols = np.concatenate(all_cols)
+        feature_values = {name: np.concatenate(all_feature_values[name]) for name in self.feature_names}
+        train_valid = np.concatenate(all_train_valid)
+        insitu_valid = np.concatenate(all_insitu_valid)
+
+        return rows, cols, feature_values, train_valid, insitu_valid, all_dates
+
+
 T = TypeVar("T")
 
 
@@ -320,7 +328,7 @@ class BaseDataStore(Generic[T]):
 
 
 class InsituStatsStore(BaseDataStore[np.ndarray]):
-    # TODO resolution
+
     def __init__(self, resolution: str):
         super().__init__()
         self.resolution = resolution

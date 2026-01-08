@@ -16,7 +16,7 @@ from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from Constant import *
-from Task.DownscaleSM.Dataset import TrainDataset, InsituStatsDataset, InsituDataset, GridInfoStore
+from Task.DownscaleSM.Dataset import TrainDataset, InsituStatsStore, InsituDataset, GridInfoStore
 from Task.DownscaleSM.Evaluator import Evaluator
 from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, InsituStatsEmbedding, FiLMResBlock, \
     BiasCorrector
@@ -52,8 +52,8 @@ SM_MIN = 0.02
 SM_MAX = 0.5
 
 # Control Flag
-TRAINING = False
-TEST = True
+TRAINING = True
+CORRECT_TRAINING = True
 
 
 def main():
@@ -62,12 +62,11 @@ def main():
     model_save_path = os.path.join(CHECKPOINT_DIR_PATH, "DownscaleSM", "Diffusers")
 
     dataset = TrainDataset()
-    insitu_stats_dataset = InsituStatsDataset()
-    train_size = int(0.8 * len(dataset))
-    val_size = int(0.1 * len(dataset))
-    test_size = len(dataset) - train_size - val_size
-    train_dataset, val_dataset, test_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size, test_size],
+    insitu_stats_store = InsituStatsStore(resolution=RESOLUTION_36KM)
+    train_size = int(0.9 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size],
         generator=torch.Generator().manual_seed(42)
     )
 
@@ -84,18 +83,25 @@ def main():
             res_block_num=3,
         ).to(device)
         trainer = Trainer(model, scheduler, train_dataset, val_dataset, device=device, early_stopping=early_stopping,
-                          insitu_stats_dataset=insitu_stats_dataset,
+                          insitu_stats_store=insitu_stats_store,
                           total_epoch=TOTAL_EPOCH, batch_size=BATCH_SIZE, lr=LR)
         model = trainer.run()
         model.save_pretrained(model_save_path)
 
-    # Testing Phase
-    if TEST:
+    model = NoisePredictor.from_pretrained(model_save_path).to(device)
+
+    # Correction Phase
+    if CORRECT_TRAINING:
         print("\n" + "=" * 60)
-        print(f"Testing ...")
+        print(f"Correcting Training Data ...")
         print("=" * 60)
-        model = NoisePredictor.from_pretrained(model_save_path).to(device)
-        test(model, scheduler, test_dataset, insitu_stats_dataset, device)
+        correct_train(model, scheduler, dataset, insitu_stats_store, device)
+
+    # Testing Phase
+    print("\n" + "=" * 60)
+    print(f"Testing ...")
+    print("=" * 60)
+    test(model, scheduler, dataset, insitu_stats_store, device)
 
 
 class NoisePredictor(ModelMixin, ConfigMixin):
@@ -204,7 +210,7 @@ class Trainer:
                  val_dataset: Dataset,
                  device: str,
                  early_stopping: EarlyStopping,
-                 insitu_stats_dataset: InsituStatsDataset,
+                 insitu_stats_store: InsituStatsStore,
                  total_epoch: int,
                  batch_size: int, lr: float):
         self.model = model
@@ -213,7 +219,7 @@ class Trainer:
         self.val_dataset = val_dataset
         self.device = device
         self.early_stopping = early_stopping
-        self.insitu_stats_dataset = insitu_stats_dataset
+        self.insitu_stats_store = insitu_stats_store
         self.total_epoch = total_epoch
         self.batch_size = batch_size
         self.lr = lr
@@ -228,7 +234,7 @@ class Trainer:
             batch_pos = batch_pos.to(self.device)
 
             batch_insitu_stats = torch.stack([
-                torch.from_numpy(self.insitu_stats_dataset.get_stats(date)).float()
+                torch.from_numpy(self.insitu_stats_store.get(date)).float()
                 for date in batch_dates
             ]).to(self.device)
 
@@ -344,95 +350,133 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
     return ys
 
 
-def test(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Dataset,
-         insitu_stats_dataset: InsituStatsDataset, device: str):
-    data_loader = DataLoader(dataset, batch_size=len(dataset), shuffle=False)  # type: ignore[arg-type]
-    xs, true_ys, pos, dates = next(iter(data_loader))
-    xs = xs.to(device)
-    pos = pos.to(device)
-    insitu_stats = torch.stack([
-        torch.from_numpy(insitu_stats_dataset.get_stats(date)).float()
-        for date in dates
-    ]).to(device)
+def correct_train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: TrainDataset,
+                  insitu_stats_store: InsituStatsStore, device: str):
+    CORRECT_BATCH_SIZE = 10000
+    data_loader = DataLoader(dataset, batch_size=CORRECT_BATCH_SIZE, shuffle=False)
 
-    # Inference
+    all_pred_ys, all_pos, all_dates, all_xs = [], [], [], []
     with torch.no_grad():
-        pred_ys = reverse_diffuse(
-            model, scheduler, xs, pos, dates, INFERENCE_STEP_NUM, device=device,
-            insitu_stats=insitu_stats
-        )
+        for batch_xs, batch_true_ys, batch_pos, batch_dates in data_loader:
+            batch_xs = batch_xs.to(device)
+            batch_pos = batch_pos.to(device)
+            batch_insitu_stats = torch.stack([
+                torch.from_numpy(insitu_stats_store.get(date)).float()
+                for date in batch_dates
+            ]).to(device)
 
-    # Denormalize
-    pred_ys = dataset.dataset.denorm_y(pred_ys)
+            batch_pred_ys = reverse_diffuse(
+                model, scheduler, batch_xs, batch_pos, list(batch_dates), INFERENCE_STEP_NUM, device=device,
+                insitu_stats=batch_insitu_stats
+            )
+
+            all_pred_ys.append(batch_pred_ys)
+            all_pos.append(batch_pos)
+            all_dates.extend(list(batch_dates))
+            all_xs.append(batch_xs)
+
+    pred_ys = torch.cat(all_pred_ys, dim=0)
+    pos = torch.cat(all_pos, dim=0)
+    xs = torch.cat(all_xs, dim=0)
+
+    pred_ys = dataset.denorm_y(pred_ys)
+
     pred_ys = pred_ys.cpu().numpy()
-    true_ys = dataset.dataset.denorm_y(true_ys)
-    true_ys = true_ys.numpy()
+    pos = pos.cpu().numpy()
+    xs = xs.cpu().numpy()
 
-    # TODO Get InSitu Data
-    grid_info_store = GridInfoStore(resolution=RESOLUTION_36KM)
-    rows, cols = pos2grid_index(pos.cpu().numpy(), REF_GRID_36KM_PATH)
+    # Get InSitu Data
+    rows, cols = pos2grid_index(pos, REF_GRID_36KM_PATH)
     insitu_dataset = InsituDataset(resolution=RESOLUTION_36KM)
-    insitus, insitu_masks = insitu_dataset.get_data_by_date_row_col(list(dates), rows.flatten(), cols.flatten())
+    insitus, insitu_masks = insitu_dataset.get_data_by_date_row_col(all_dates, rows.flatten(), cols.flatten())
 
     # RF Bias Corrector
     rf_corrector = BiasCorrector()
-    xs = xs.cpu().numpy()
     rf_corrector.train(
         pred_ys=pred_ys,
         insitus=insitus.flatten(),
         insitu_masks=insitu_masks.flatten(),
         aux_feats=xs
     )
-    # Bias correction
-    pred_ys_corrected = rf_corrector.predict(
+
+
+def test(model: NoisePredictor, scheduler: DDPMScheduler, train_dataset: TrainDataset,
+         insitu_stats_store: InsituStatsStore, device: str):
+    TEST_BATCH_SIZE = 10000
+    data_loader = DataLoader(train_dataset, batch_size=TEST_BATCH_SIZE, shuffle=False)
+
+    all_pred_ys, all_true_ys, all_pos, all_dates, all_xs = [], [], [], [], []
+    with torch.no_grad():
+        for batch_xs, batch_true_ys, batch_pos, batch_dates in data_loader:
+            batch_xs = batch_xs.to(device)
+            batch_pos = batch_pos.to(device)
+            batch_insitu_stats = torch.stack([
+                torch.from_numpy(insitu_stats_store.get(date)).float()
+                for date in batch_dates
+            ]).to(device)
+
+            batch_pred_ys = reverse_diffuse(
+                model, scheduler, batch_xs, batch_pos, list(batch_dates), INFERENCE_STEP_NUM, device=device,
+                insitu_stats=batch_insitu_stats
+            )
+
+            all_pred_ys.append(batch_pred_ys)
+            all_true_ys.append(batch_true_ys.to(device))
+            all_pos.append(batch_pos)
+            all_dates.extend(list(batch_dates))
+            all_xs.append(batch_xs)
+
+    # Concatenate all batches
+    pred_ys = torch.cat(all_pred_ys, dim=0)
+    true_ys = torch.cat(all_true_ys, dim=0)
+    pos = torch.cat(all_pos, dim=0)
+    xs = torch.cat(all_xs, dim=0)
+
+    # Denormalize
+    pred_ys = train_dataset.denorm_y(pred_ys)
+    pred_ys = pred_ys.cpu().numpy()
+    true_ys = train_dataset.denorm_y(true_ys)
+    true_ys = true_ys.cpu().numpy()
+    pos = pos.cpu().numpy()
+    xs = xs.cpu().numpy()
+
+    # Get InSitu Data
+    grid_info_store = GridInfoStore(resolution=RESOLUTION_36KM)
+    rows, cols = pos2grid_index(pos, REF_GRID_36KM_PATH)
+    insitu_dataset = InsituDataset(resolution=RESOLUTION_36KM)
+    insitus, insitu_masks = insitu_dataset.get_data_by_date_row_col(all_dates, rows.flatten(), cols.flatten())
+
+    # Load Bias Corrector (already trained)
+    rf_corrector = BiasCorrector()
+    pred_ys = rf_corrector.predict(
         pred_ys=pred_ys,
         aux_feats=xs
     )
-    pred_ys_corrected = np.clip(pred_ys_corrected, SM_MIN, SM_MAX)
+    pred_ys = np.clip(pred_ys, SM_MIN, SM_MAX)
 
-    # Evaluate
+    # Evaluate corrected predictions only
     evaluator = Evaluator(min_site_num=2, min_date_num=2)
 
-    # Evaluate original predictions
-    print("\n" + "=" * 60)
-    print("Evaluation by Date: Original Predictions vs InSitu Data")
-    print("=" * 60)
-
-    df_result_date_orig = evaluator.evaluate_by_date(pred_ys, insitus, insitu_masks, dates, true_ys=true_ys)
-    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Date_Test_Original.csv")
-    df_result_date_orig.to_csv(dst_file_path, index=False)
-
-    # Evaluate corrected predictions
     print("\n" + "=" * 60)
     print("Evaluation by Date: Corrected Predictions vs InSitu Data")
     print("=" * 60)
 
-    df_result_date_corr = evaluator.evaluate_by_date(pred_ys_corrected, insitus, insitu_masks, dates, true_ys=true_ys)
-    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Date_Test_Corrected.csv")
-    df_result_date_corr.to_csv(dst_file_path, index=False)
+    df_result_date = evaluator.evaluate_by_date(pred_ys, insitus, insitu_masks, all_dates, true_ys=true_ys)
+    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Date_Test.csv")
+    df_result_date.to_csv(dst_file_path, index=False)
 
-    # Evaluate by Site - Original
-    print("\n" + "=" * 60)
-    print("Evaluation by Site: Original Predictions vs InSitu Data")
-    print("=" * 60)
-
-    df_result_site_orig = evaluator.evaluate_by_site(pred_ys, insitus, insitu_masks, dates, rows, cols, true_ys=true_ys)
-    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Site_Test_Original.csv")
-    df_result_site_orig.to_csv(dst_file_path, index=False)
-
-    # Evaluate by Site - Corrected
     print("\n" + "=" * 60)
     print("Evaluation by Site: Corrected Predictions vs InSitu Data")
     print("=" * 60)
 
-    df_result_site_corr = evaluator.evaluate_by_site(pred_ys_corrected, insitus, insitu_masks, dates, rows, cols,
-                                                     true_ys=true_ys)
-    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Site_Test_Corrected.csv")
-    df_result_site_corr.to_csv(dst_file_path, index=False)
+    df_result_site = evaluator.evaluate_by_site(pred_ys, insitus, insitu_masks, all_dates, rows, cols,
+                                                true_ys=true_ys)
+    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Site_Test.csv")
+    df_result_site.to_csv(dst_file_path, index=False)
 
     # Evaluate by Spatial Distribution
     grid_info = grid_info_store.get()
-    evaluator.evaluate_by_spatial_distribution(df_result_site_corr, height=grid_info['H'], width=grid_info['W'])
+    evaluator.evaluate_by_spatial_distribution(df_result_site, height=grid_info['H'], width=grid_info['W'])
 
 
 if __name__ == "__main__":
