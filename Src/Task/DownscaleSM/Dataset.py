@@ -22,7 +22,6 @@ class TrainDataset(Dataset):
         self.resolution = resolution
         self.data_store = DataStore(resolution=self.resolution)
         self.grid_info_store = GridInfoStore(resolution=self.resolution)
-        self.data_names = [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME]
         self._load_data()
         self._filter_valid()
         self._norm()
@@ -33,29 +32,41 @@ class TrainDataset(Dataset):
 
         grid_info = self.grid_info_store.get()
 
-        xs_list, ys_list = [], []
+        xs_list, ys_list, insitu_list = [], [], []
 
         for date in dates:
             xs_date = np.stack([
-                self.data_store.get(name, date) for name in self.data_names
+                self.data_store.get(name, date) for name in
+                [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME]
             ], axis=-1)
             ys_date = self.data_store.get(SM_NAME, date)[:, :, np.newaxis]
+            insitu_date = self.data_store.get(IN_SITU_NAME, date)
 
             xs_list.append(xs_date)
             ys_list.append(ys_date)
+            insitu_list.append(insitu_date)
 
         xs = np.array(xs_list, dtype=np.float32)
         ys = np.array(ys_list, dtype=np.float32)
+        insitu = np.array(insitu_list, dtype=np.float32)
 
         date_num = len(dates)
         H = grid_info["H"]
         W = grid_info["W"]
         self.xs = xs.reshape(date_num * H * W, -1).astype(np.float32)
         self.ys = ys.reshape(date_num * H * W, -1).astype(np.float32)
+        self.insitus = insitu.reshape(date_num * H * W).astype(np.float32)
 
         pos_grid = grid_info["pos"]
         pos_expanded = np.tile(pos_grid[np.newaxis, :, :, :], (date_num, 1, 1, 1))
         self.pos = pos_expanded.reshape(date_num * H * W, -1).astype(np.float32)
+
+        rows_grid = grid_info["rows"]
+        cols_grid = grid_info["cols"]
+        rows_expanded = np.tile(rows_grid[np.newaxis, :, :], (date_num, 1, 1))
+        cols_expanded = np.tile(cols_grid[np.newaxis, :, :], (date_num, 1, 1))
+        self.rows = rows_expanded.reshape(date_num * H * W).astype(np.int32)
+        self.cols = cols_expanded.reshape(date_num * H * W).astype(np.int32)
 
         self.date_indices = np.repeat(np.arange(date_num), H * W).astype(np.int32)
 
@@ -65,7 +76,12 @@ class TrainDataset(Dataset):
         self.xs = self.xs[valid]
         self.pos = self.pos[valid]
         self.ys = self.ys[valid, 0]
+        self.insitus = self.insitus[valid]
+        self.rows = self.rows[valid]
+        self.cols = self.cols[valid]
         self.date_indices = self.date_indices[valid]
+
+        self.insitu_masks = (~np.isnan(self.insitus)).astype(np.float32)
 
     def _norm(self):
         self.x_mean = self.xs.mean(axis=0).astype(np.float32)
@@ -153,43 +169,6 @@ class InferenceDataset(Dataset):
         col = self.cols[idx]
 
         return xs, pos, date, row, col
-
-
-class InsituDataset(Dataset):
-    def __init__(self, resolution: str):
-        self.resolution = resolution
-        self.insitu_dir = os.path.join(PROCESSED_DIR_PATH, IN_SITU_NAME, self.resolution)
-
-        ref_grid_path = REF_GRID_1KM_PATH if self.resolution == RESOLUTION_1KM else REF_GRID_36KM_PATH
-        _, lon_grid, lat_grid = read_tiff(ref_grid_path, dst_epsg_code=4326)
-        self.H, self.W = lon_grid.shape
-        self._cache = {}
-
-    def _load_date_data(self, date: str):
-        if date in self._cache:
-            return self._cache[date]
-        insitu_path = os.path.join(self.insitu_dir, f'{date}{TIFF_SUFFIX}')
-        insitu_map = read_tiff_data(insitu_path).astype(np.float32).flatten() if os.path.exists(
-            insitu_path) else np.full(self.H * self.W, np.nan, dtype=np.float32)
-        insitu_mask = (~np.isnan(insitu_map)).astype(np.float32)
-        self._cache[date] = (insitu_map, insitu_mask)
-        return self._cache[date]
-
-    def get_data_by_date(self, date: str) -> tuple:
-        insitu_map, insitu_mask = self._load_date_data(date)
-        rows, cols = np.meshgrid(np.arange(self.H, dtype=np.int32), np.arange(self.W, dtype=np.int32), indexing='ij')
-        return insitu_map, insitu_mask, rows.flatten(), cols.flatten()
-
-    def get_data_by_date_row_col(self, dates: list, rows: np.ndarray, cols: np.ndarray) -> tuple:
-        unique_dates = list(set(dates))
-        date_data_cache = {date: self._load_date_data(date) for date in unique_dates}
-        indices = rows.astype(np.int32) * self.W + cols.astype(np.int32)
-        matched_insitus, matched_insitu_masks = [], []
-        for i, date in enumerate(dates):
-            insitu_map, insitu_mask = date_data_cache[date]
-            matched_insitus.append(insitu_map[indices[i]])
-            matched_insitu_masks.append(insitu_mask[indices[i]])
-        return np.array(matched_insitus), np.array(matched_insitu_masks)
 
 
 # TODO 只评估实际参与训练的点

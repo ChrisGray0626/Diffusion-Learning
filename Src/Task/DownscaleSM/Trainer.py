@@ -16,12 +16,11 @@ from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from Constant import *
-from Task.DownscaleSM.Dataset import TrainDataset, InsituStatsStore, InsituDataset, GridInfoStore
+from Task.DownscaleSM.Dataset import TrainDataset, InsituStatsStore
 from Task.DownscaleSM.Evaluator import Evaluator
 from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, InsituStatsEmbedding, FiLMResBlock, \
     BiasCorrector
 from Util.ModelHelper import SinusoidalPosEmb, EarlyStopping
-from Util.TiffUtil import pos2grid_index
 from Util.Util import build_device
 
 # Dataset setting
@@ -52,7 +51,7 @@ SM_MIN = 0.02
 SM_MAX = 0.5
 
 # Control Flag
-TRAINING = True
+TRAINING = False
 CORRECT_TRAINING = True
 
 
@@ -352,10 +351,10 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
 
 def correct_train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: TrainDataset,
                   insitu_stats_store: InsituStatsStore, device: str):
-    CORRECT_BATCH_SIZE = 10000
+    CORRECT_BATCH_SIZE = 16384
     data_loader = DataLoader(dataset, batch_size=CORRECT_BATCH_SIZE, shuffle=False)
 
-    all_pred_ys, all_pos, all_dates, all_xs = [], [], [], []
+    all_pred_ys, all_xs = [], []
     with torch.no_grad():
         for batch_xs, batch_true_ys, batch_pos, batch_dates in data_loader:
             batch_xs = batch_xs.to(device)
@@ -371,41 +370,33 @@ def correct_train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: Trai
             )
 
             all_pred_ys.append(batch_pred_ys)
-            all_pos.append(batch_pos)
-            all_dates.extend(list(batch_dates))
             all_xs.append(batch_xs)
 
     pred_ys = torch.cat(all_pred_ys, dim=0)
-    pos = torch.cat(all_pos, dim=0)
     xs = torch.cat(all_xs, dim=0)
 
+    # Denormalize
     pred_ys = dataset.denorm_y(pred_ys)
 
     pred_ys = pred_ys.cpu().numpy()
-    pos = pos.cpu().numpy()
     xs = xs.cpu().numpy()
-
-    # Get InSitu Data
-    rows, cols = pos2grid_index(pos, REF_GRID_36KM_PATH)
-    insitu_dataset = InsituDataset(resolution=RESOLUTION_36KM)
-    insitus, insitu_masks = insitu_dataset.get_data_by_date_row_col(all_dates, rows.flatten(), cols.flatten())
 
     # RF Bias Corrector
     rf_corrector = BiasCorrector()
     rf_corrector.train(
         pred_ys=pred_ys,
-        insitus=insitus.flatten(),
-        insitu_masks=insitu_masks.flatten(),
+        insitus=dataset.insitus,
+        insitu_masks=dataset.insitu_masks,
         aux_feats=xs
     )
 
 
 def test(model: NoisePredictor, scheduler: DDPMScheduler, train_dataset: TrainDataset,
          insitu_stats_store: InsituStatsStore, device: str):
-    TEST_BATCH_SIZE = 10000
+    TEST_BATCH_SIZE = 16384
     data_loader = DataLoader(train_dataset, batch_size=TEST_BATCH_SIZE, shuffle=False)
 
-    all_pred_ys, all_true_ys, all_pos, all_dates, all_xs = [], [], [], [], []
+    all_pred_ys, all_true_ys, all_dates, all_xs = [], [], [], []
     with torch.no_grad():
         for batch_xs, batch_true_ys, batch_pos, batch_dates in data_loader:
             batch_xs = batch_xs.to(device)
@@ -422,14 +413,11 @@ def test(model: NoisePredictor, scheduler: DDPMScheduler, train_dataset: TrainDa
 
             all_pred_ys.append(batch_pred_ys)
             all_true_ys.append(batch_true_ys.to(device))
-            all_pos.append(batch_pos)
             all_dates.extend(list(batch_dates))
             all_xs.append(batch_xs)
 
-    # Concatenate all batches
     pred_ys = torch.cat(all_pred_ys, dim=0)
     true_ys = torch.cat(all_true_ys, dim=0)
-    pos = torch.cat(all_pos, dim=0)
     xs = torch.cat(all_xs, dim=0)
 
     # Denormalize
@@ -437,20 +425,17 @@ def test(model: NoisePredictor, scheduler: DDPMScheduler, train_dataset: TrainDa
     pred_ys = pred_ys.cpu().numpy()
     true_ys = train_dataset.denorm_y(true_ys)
     true_ys = true_ys.cpu().numpy()
-    pos = pos.cpu().numpy()
-    xs = xs.cpu().numpy()
 
-    # Get InSitu Data
-    grid_info_store = GridInfoStore(resolution=RESOLUTION_36KM)
-    rows, cols = pos2grid_index(pos, REF_GRID_36KM_PATH)
-    insitu_dataset = InsituDataset(resolution=RESOLUTION_36KM)
-    insitus, insitu_masks = insitu_dataset.get_data_by_date_row_col(all_dates, rows.flatten(), cols.flatten())
+    insitus = train_dataset.insitus
+    insitu_masks = train_dataset.insitu_masks
+    rows = train_dataset.rows
+    cols = train_dataset.cols
 
     # Load Bias Corrector (already trained)
     rf_corrector = BiasCorrector()
     pred_ys = rf_corrector.predict(
         pred_ys=pred_ys,
-        aux_feats=xs
+        aux_feats=xs.cpu().numpy()
     )
     pred_ys = np.clip(pred_ys, SM_MIN, SM_MAX)
 
@@ -475,7 +460,7 @@ def test(model: NoisePredictor, scheduler: DDPMScheduler, train_dataset: TrainDa
     df_result_site.to_csv(dst_file_path, index=False)
 
     # Evaluate by Spatial Distribution
-    grid_info = grid_info_store.get()
+    grid_info = train_dataset.grid_info_store.get()
     evaluator.evaluate_by_spatial_distribution(df_result_site, height=grid_info['H'], width=grid_info['W'])
 
 
