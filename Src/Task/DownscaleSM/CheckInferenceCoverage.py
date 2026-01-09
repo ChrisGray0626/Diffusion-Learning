@@ -10,11 +10,11 @@ import os
 import pandas as pd
 
 from Constant import RESULT_DIR_PATH, RESOLUTION_36KM
-from Task.DownscaleSM.Dataset import InferenceEvaluationDataset
+from Task.DownscaleSM.Dataset import ResultEvaluationDataset
 
 
 def main():
-    dataset = InferenceEvaluationDataset(resolution=RESOLUTION_36KM)
+    dataset = ResultEvaluationDataset(resolution=RESOLUTION_36KM)
     pred_map, insitu_map, valid_masks, dates, rows, cols = dataset.get_all()
 
     df = pd.DataFrame({

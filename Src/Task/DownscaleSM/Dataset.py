@@ -196,7 +196,6 @@ class InferenceDataset(Dataset):
 
 
 class CorrectionDataset(Dataset):
-    """Dataset for bias correction stage, loads inference results and auxiliary features"""
 
     def __init__(self, date: str, resolution: str):
         self.date = date
@@ -211,7 +210,7 @@ class CorrectionDataset(Dataset):
         self._norm()
 
     def _load_data(self):
-        # Load inference result (uncorrected prediction)
+        # Load inference result
         pred_map = self.inference_result_store.get(self.date)
 
         # Load auxiliary features
@@ -231,9 +230,6 @@ class CorrectionDataset(Dataset):
         self.cols_full = grid_info["cols"].flatten()
 
     def _filter_valid(self):
-        # Filter positions where auxiliary features are valid (same as InferenceDataset)
-        # The pred_map only has values at positions that were valid during inference
-        # So we filter using the same logic as InferenceDataset (only xs validity)
         valid = ~np.isnan(self.xs).any(axis=1)
         self.valid_indices = np.where(valid)[0]
 
@@ -258,12 +254,11 @@ class CorrectionDataset(Dataset):
         return xs, pred_y, row, col
 
 
-# TODO 只评估实际参与训练的点
-class InferenceEvaluationDataset(Dataset):
+class ResultEvaluationDataset(Dataset):
 
     def __init__(self, resolution: str):
         self.resolution = resolution
-        self.inference_result_store = InferenceResultStore(resolution=self.resolution)
+        self.result_store = CorrectionResultStore(resolution=self.resolution)
         self.data_store = DataStore(resolution=self.resolution)
         self.grid_info_store = GridInfoStore(resolution=self.resolution)
 
@@ -273,7 +268,7 @@ class InferenceEvaluationDataset(Dataset):
         self.cols = grid_info["cols"]
 
     def get(self, date: str) -> tuple:
-        pred_map = self.inference_result_store.get(date)
+        pred_map = self.result_store.get(date)
         insitu_map = self.data_store.get(IN_SITU_NAME, date)
 
         pred_mask = (~np.isnan(pred_map)).astype(np.float32)
@@ -443,6 +438,26 @@ class InferenceResultStore(BaseDataStore[np.ndarray]):
 
     def _build_path(self, date: str) -> str:
         return os.path.join(INFERENCE_DIR_PATH, self.resolution, f"{date}{TIFF_SUFFIX}")
+
+
+class CorrectionResultStore(BaseDataStore[np.ndarray]):
+
+    def __init__(self, resolution: str):
+        super().__init__()
+        self.resolution = resolution
+
+    def get(self, date: Optional[str] = None, cache_used: bool = True) -> np.ndarray:
+        key = (date, self.resolution)
+        return self._get(key, lambda: self._load(date), cache_used=cache_used)
+
+    def _load(self, date: str) -> np.ndarray:
+        file_path = self._build_path(date)
+        data = read_tiff_data(file_path).astype(np.float32)
+
+        return data
+
+    def _build_path(self, date: str) -> str:
+        return os.path.join(CORRECTION_DIR_PATH, self.resolution, f"{date}{TIFF_SUFFIX}")
 
 
 class DataStore(BaseDataStore[np.ndarray]):

@@ -13,51 +13,37 @@ from tqdm import tqdm
 
 from Constant import *
 from Task.DownscaleSM.Dataset import InferenceDataset, GridInfoStore
-from Task.DownscaleSM.Module import BiasCorrector
-from Task.DownscaleSM.Trainer import NoisePredictor, build_scheduler, reverse_diffuse
-from Util.TiffUtil import write_tiff, read_tiff_meta
+from Task.DownscaleSM.Module import NoisePredictor
+from Task.DownscaleSM.Trainer import build_scheduler, reverse_diffuse
+from Util.TiffUtil import write_tiff
 from Util.Util import get_valid_dates, build_device
 
 INFERENCE_STEP_NUM = 50
 BATCH_SIZE = 16384
-SM_MIN = 0.02
-SM_MAX = 0.5
 
-RESOLUTION = RESOLUTION_36KM
-REF_GRID_PATH = REF_GRID_1KM_PATH if RESOLUTION == RESOLUTION_1KM else REF_GRID_36KM_PATH
+RESOLUTION = RESOLUTION_1KM
 
 
 def main():
     device = build_device()
     print(f"Device: {device}")
     model = build_model()
-    rf_corrector = BiasCorrector()
-    transform, crs, _, _ = read_tiff_meta(REF_GRID_PATH)
-    for date in tqdm(get_valid_dates()):
-        dataset = InferenceDataset(date=date, resolution=RESOLUTION)
+    grid_info = GridInfoStore(RESOLUTION).get()
+    dst_dir_path = os.path.join(INFERENCE_DIR_PATH, RESOLUTION)
+    os.makedirs(dst_dir_path, exist_ok=True)
+
+    dates = get_valid_dates()
+    for date in tqdm(dates, desc="Inference"):
+        inference_dataset = InferenceDataset(date=date, resolution=RESOLUTION)
 
         # Inference
-        pred_ys = inference(model=model, dataset=dataset, device=device)
+        pred_ys = inference(model=model, dataset=inference_dataset, device=device)
 
-        # Correction
-        pred_ys = rf_corrector.predict(
-            pred_ys=pred_ys,
-            aux_feats=dataset.xs
-        )
-
-        # Clip
-        pred_ys = np.clip(pred_ys, SM_MIN, SM_MAX)
-
-        # Convert to map
-        grid_info = GridInfoStore(RESOLUTION).get()
+        # Save Inference Result
         pred_map = np.full((grid_info["H"], grid_info["W"]), np.nan, dtype=np.float32)
-        pred_map[dataset.rows, dataset.cols] = pred_ys
-
-        # Write TIFF
-        dst_dir_path = os.path.join(INFERENCE_DIR_PATH, RESOLUTION)
-        os.makedirs(dst_dir_path, exist_ok=True)
+        pred_map[inference_dataset.rows, inference_dataset.cols] = pred_ys
         dst_file_path = os.path.join(dst_dir_path, f"{date}{TIFF_SUFFIX}")
-        write_tiff(pred_map, dst_file_path, transform=transform, crs=crs)
+        write_tiff(pred_map, dst_file_path, transform=grid_info["transform"], crs=grid_info["crs"])
 
 
 def build_model() -> NoisePredictor:

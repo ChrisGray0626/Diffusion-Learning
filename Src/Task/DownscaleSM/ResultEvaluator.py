@@ -7,21 +7,21 @@
 """
 import os
 
-from Constant import RESULT_DIR_PATH, RESOLUTION_36KM
-from Task.DownscaleSM.Dataset import InferenceEvaluationDataset
+from Constant import RESULT_DIR_PATH, RESOLUTION_1KM
+from Task.DownscaleSM.Dataset import ResultEvaluationDataset
 from Task.DownscaleSM.Evaluator import Evaluator
 
-RESOLUTION = RESOLUTION_36KM
+RESOLUTION = RESOLUTION_1KM
 
 
 def main():
-    dataset = InferenceEvaluationDataset(resolution=RESOLUTION)
+    dataset = ResultEvaluationDataset(resolution=RESOLUTION)
     evaluator = Evaluator(min_site_num=2, min_date_num=2)
 
     pred_map, insitu_map, insitu_masks, dates, rows, cols = dataset.get_all()
     # Evaluate by Date
     print("\n" + "=" * 60)
-    print(f"Evaluation by Date: {RESOLUTION} Inference Results vs InSitu Data")
+    print(f"Evaluation by Date: {RESOLUTION} Correction Results vs InSitu Data")
     print("=" * 60)
     df_result_date = evaluator.evaluate_by_date(pred_map, insitu_map, insitu_masks, dates)
     dst_file_path = os.path.join(RESULT_DIR_PATH, f"Evaluation_By_Date_{RESOLUTION}.csv")
@@ -29,7 +29,7 @@ def main():
 
     # Evaluate by Site
     print("\n" + "=" * 60)
-    print(f"Evaluation by Site: {RESOLUTION} Inference Results vs InSitu Data")
+    print(f"Evaluation by Site: {RESOLUTION} Correction Results vs InSitu Data")
     print("=" * 60)
     df_result_site = evaluator.evaluate_by_site(pred_map, insitu_map, insitu_masks, dates, rows, cols)
     dst_file_path = os.path.join(RESULT_DIR_PATH, f"Evaluation_By_Site_{RESOLUTION}.csv")

@@ -15,6 +15,7 @@ DATA_DIR_PATH = os.getenv("DATA_DIR_PATH", "/Volumes/Elements SE/Data/Downscale-
 RAW_DIR_PATH: str = os.path.join(DATA_DIR_PATH, "Raw/2016-2020")
 PROCESSED_DIR_PATH = os.path.join(DATA_DIR_PATH, "Processed")
 INFERENCE_DIR_PATH = os.path.join(DATA_DIR_PATH, "Inference")
+CORRECTION_DIR_PATH = os.path.join(DATA_DIR_PATH, "Correction")
 
 VALID_DATE_FILE_PATH = os.path.join(DATA_DIR_PATH, "ValidDate.txt")
 
