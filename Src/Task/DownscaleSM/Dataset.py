@@ -5,6 +5,7 @@
   @Author Chris
   @Date 2025/11/12
 """
+import threading
 from typing import Dict, Optional, Hashable, TypeVar, Generic, Callable
 
 import numpy as np
@@ -12,19 +13,33 @@ import torch
 from torch.utils.data import Dataset
 
 from Constant import *
-from Util.TiffUtil import read_tiff, read_tiff_data
+from Util.TiffUtil import read_tiff, read_tiff_data, read_tiff_meta
 from Util.Util import get_valid_dates
 
 
 class TrainDataset(Dataset):
+    _instance = None
+    _lock = threading.Lock()
 
-    def __init__(self, resolution: str = RESOLUTION_36KM):
-        self.resolution = resolution
+    def __new__(cls):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __init__(self):
+        if hasattr(self, '_initialized'):
+            return
+
+        self.resolution = RESOLUTION_36KM
         self.data_store = DataStore(resolution=self.resolution)
         self.grid_info_store = GridInfoStore(resolution=self.resolution)
         self._load_data()
         self._filter_valid()
         self._norm()
+
+        self._initialized = True
 
     def _load_data(self):
         dates = get_valid_dates()
@@ -122,7 +137,6 @@ class InferenceDataset(Dataset):
         self.data_store = DataStore(resolution=self.resolution)
         self.insitu_stats_store = InsituStatsStore(resolution=self.resolution)
         self.grid_info_store = GridInfoStore(resolution=self.resolution)
-        self.data_names = [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME]
         self.train_dataset = TrainDataset()
 
         self._load_data()
@@ -130,25 +144,35 @@ class InferenceDataset(Dataset):
         self._norm()
 
     def _load_data(self):
-        xs = np.stack([self.data_store.get(name, self.date) for name in self.data_names], axis=-1)
+        xs = np.stack([self.data_store.get(name, self.date) for name in
+                       [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME]], axis=-1)
 
         grid_info = self.grid_info_store.get()
         H, W = grid_info["H"], grid_info["W"]
 
         self.xs = xs.reshape(H * W, -1).astype(np.float32)
         self.pos = grid_info["pos"].reshape(H * W, -1).astype(np.float32)
-        self.rows = grid_info["rows"].flatten()
-        self.cols = grid_info["cols"].flatten()
+        self.grid_info = grid_info
+        self.rows_full = grid_info["rows"].flatten()
+        self.cols_full = grid_info["cols"].flatten()
 
         self.insitu_stats = self.insitu_stats_store.get(self.date)
 
+        # Load in-situ data for bias correction training
+        insitu_map = self.data_store.get(IN_SITU_NAME, self.date)
+        self.insitu = insitu_map.flatten().astype(np.float32)
+        self.insitu_mask = (~np.isnan(self.insitu)).astype(np.float32)
+
     def _filter_valid(self):
         valid = ~np.isnan(self.xs).any(axis=1)
+        self.valid_indices = np.where(valid)[0]
 
         self.xs = self.xs[valid]
         self.pos = self.pos[valid]
-        self.rows = self.rows[valid]
-        self.cols = self.cols[valid]
+        self.rows = self.rows_full[valid]
+        self.cols = self.cols_full[valid]
+        self.insitu = self.insitu[valid]
+        self.insitu_mask = self.insitu_mask[valid]
 
     def _norm(self):
         x_mean = self.train_dataset.x_mean
@@ -169,6 +193,69 @@ class InferenceDataset(Dataset):
         col = self.cols[idx]
 
         return xs, pos, date, row, col
+
+
+class CorrectionDataset(Dataset):
+    """Dataset for bias correction stage, loads inference results and auxiliary features"""
+
+    def __init__(self, date: str, resolution: str):
+        self.date = date
+        self.resolution = resolution
+        self.inference_result_store = InferenceResultStore(resolution=self.resolution)
+        self.data_store = DataStore(resolution=self.resolution)
+        self.grid_info_store = GridInfoStore(resolution=self.resolution)
+        self.train_dataset = TrainDataset()
+
+        self._load_data()
+        self._filter_valid()
+        self._norm()
+
+    def _load_data(self):
+        # Load inference result (uncorrected prediction)
+        pred_map = self.inference_result_store.get(self.date)
+
+        # Load auxiliary features
+        xs = np.stack([
+            self.data_store.get(name, self.date) for name in
+            [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME]
+        ], axis=-1)
+
+        grid_info = self.grid_info_store.get()
+        H, W = grid_info["H"], grid_info["W"]
+
+        # Flatten prediction map and auxiliary features
+        self.pred_map = pred_map.astype(np.float32)  # Keep as 2D for indexing
+        self.xs = xs.reshape(H * W, -1).astype(np.float32)
+        self.grid_info = grid_info
+        self.rows_full = grid_info["rows"].flatten()
+        self.cols_full = grid_info["cols"].flatten()
+
+    def _filter_valid(self):
+        # Filter positions where auxiliary features are valid (same as InferenceDataset)
+        # The pred_map only has values at positions that were valid during inference
+        # So we filter using the same logic as InferenceDataset (only xs validity)
+        valid = ~np.isnan(self.xs).any(axis=1)
+        self.valid_indices = np.where(valid)[0]
+
+        self.xs = self.xs[valid]
+        self.rows = self.rows_full[valid]
+        self.cols = self.cols_full[valid]
+
+    def _norm(self):
+        x_mean = self.train_dataset.x_mean
+        x_std = self.train_dataset.x_std.copy()
+        x_std[x_std == 0] = 1.0
+        self.xs = (self.xs - x_mean) / x_std
+
+    def __len__(self):
+        return len(self.xs)
+
+    def __getitem__(self, idx):
+        xs = torch.from_numpy(self.xs[idx]).float()
+        pred_y = torch.tensor(self.pred_map[self.rows[idx], self.cols[idx]], dtype=torch.float32)
+        row = torch.tensor(self.rows[idx], dtype=torch.long)
+        col = torch.tensor(self.cols[idx], dtype=torch.long)
+        return xs, pred_y, row, col
 
 
 # TODO 只评估实际参与训练的点
@@ -398,8 +485,8 @@ class GridInfoStore(BaseDataStore[Dict]):
         else:
             ref_path = REF_GRID_36KM_PATH
 
+        transform, crs, H, W = read_tiff_meta(ref_path)
         _, lons, lats = read_tiff(ref_path, dst_epsg_code=4326)
-        H, W = lons.shape
         rows, cols = np.meshgrid(np.arange(H, dtype=np.int32),
                                  np.arange(W, dtype=np.int32), indexing="ij")
         grid_info = {
@@ -410,5 +497,7 @@ class GridInfoStore(BaseDataStore[Dict]):
             "H": H,
             "W": W,
             "pos": np.stack([lons, lats], axis=-1).astype(np.float32),
+            "transform": transform,
+            "crs": crs,
         }
         return grid_info

@@ -7,20 +7,15 @@
 """
 from typing import List
 
-import numpy as np
 import torch
-import torch.nn as nn
+import torch.nn.functional as F
 from diffusers import DDPMScheduler
-from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.models.modeling_utils import ModelMixin
 from torch.utils.data import Dataset, DataLoader
 
 from Constant import *
 from Task.DownscaleSM.Dataset import TrainDataset, InsituStatsStore
-from Task.DownscaleSM.Evaluator import Evaluator
-from Task.DownscaleSM.Module import TimeEmbedding, SpatialEmbedding, InsituStatsEmbedding, FiLMResBlock, \
-    BiasCorrector
-from Util.ModelHelper import SinusoidalPosEmb, EarlyStopping
+from Task.DownscaleSM.Module import NoisePredictor
+from Util.ModelHelper import EarlyStopping
 from Util.Util import build_device
 
 # Dataset setting
@@ -35,8 +30,6 @@ BETA_END = 0.02
 HIDDEN_DIM = 512
 TIMESTEP_EMB_DIM = 128
 
-INFERENCE_STEP_NUM = 50
-
 # Train setting
 TOTAL_EPOCH = 60
 BATCH_SIZE = 64
@@ -46,20 +39,8 @@ LR = 2e-4
 PATIENCE = 5
 MIN_DELTA = 1e-6
 
-# Valid range for soil moisture
-SM_MIN = 0.02
-SM_MAX = 0.5
-
-# Control Flag
-TRAINING = False
-CORRECT_TRAINING = True
-
 
 def main():
-    device = build_device()
-    scheduler = build_scheduler()
-    model_save_path = os.path.join(CHECKPOINT_DIR_PATH, "DownscaleSM", "Diffusers")
-
     dataset = TrainDataset()
     insitu_stats_store = InsituStatsStore(resolution=RESOLUTION_36KM)
     train_size = int(0.9 * len(dataset))
@@ -69,159 +50,37 @@ def main():
         generator=torch.Generator().manual_seed(42)
     )
 
-    # Training Phase
-    if TRAINING:
-        print("\n" + "=" * 60)
-        print(f"Training ...")
-        print("=" * 60)
-        early_stopping = build_early_stopping()
-        model = NoisePredictor(
-            input_feature_num=INPUT_FEATURE_NUM,
-            hidden_dim=HIDDEN_DIM,
-            timestep_emb_dim=TIMESTEP_EMB_DIM,
-            res_block_num=3,
-        ).to(device)
-        trainer = Trainer(model, scheduler, train_dataset, val_dataset, device=device, early_stopping=early_stopping,
-                          insitu_stats_store=insitu_stats_store,
-                          total_epoch=TOTAL_EPOCH, batch_size=BATCH_SIZE, lr=LR)
-        model = trainer.run()
-        model.save_pretrained(model_save_path)
+    model = NoisePredictor(
+        input_feature_num=INPUT_FEATURE_NUM,
+        hidden_dim=HIDDEN_DIM,
+        timestep_emb_dim=TIMESTEP_EMB_DIM,
+        res_block_num=3,
+    )
 
-    model = NoisePredictor.from_pretrained(model_save_path).to(device)
+    trainer = Trainer(model, train_dataset, val_dataset, insitu_stats_store)
+    model = trainer.run()
 
-    # Correction Phase
-    if CORRECT_TRAINING:
-        print("\n" + "=" * 60)
-        print(f"Correcting Training Data ...")
-        print("=" * 60)
-        correct_train(model, scheduler, dataset, insitu_stats_store, device)
-
-    # Testing Phase
-    print("\n" + "=" * 60)
-    print(f"Testing ...")
-    print("=" * 60)
-    test(model, scheduler, dataset, insitu_stats_store, device)
-
-
-class NoisePredictor(ModelMixin, ConfigMixin):
-
-    @register_to_config
-    def __init__(self, input_feature_num: int,
-                 hidden_dim: int = 512, timestep_emb_dim: int = 128,
-                 res_block_num: int = 3):
-        super().__init__()
-        self.input_feature_num = input_feature_num
-        self.hidden_dim = hidden_dim
-
-        input_dim = input_feature_num + 1
-        self.input_layer = nn.Linear(input_dim, hidden_dim)
-
-        # Timestep Embedding
-        self.timestep_embedding = nn.Sequential(
-            SinusoidalPosEmb(timestep_emb_dim),
-            nn.Linear(timestep_emb_dim, timestep_emb_dim * 4),
-            nn.SiLU(),
-            nn.Linear(timestep_emb_dim * 4, timestep_emb_dim * 4),
-        )
-        self.emb_timestep2hidden = nn.Linear(timestep_emb_dim * 4, hidden_dim)
-
-        # Time Embedding
-        self.time_embedding = TimeEmbedding(
-            hidden_dim=hidden_dim,
-            num_fourier=8
-        )
-
-        # Spatial Embedding
-        lon_min, lat_min, lon_max, lat_max = RANGE
-        self.spatial_embedding = SpatialEmbedding(
-            hidden_dim=hidden_dim,
-            num_fourier=6,
-            lon_min=lon_min,
-            lon_max=lon_max,
-            lat_min=lat_min,
-            lat_max=lat_max
-        )
-
-        # Insitu Stats Embedding
-        self.insitu_stats_embedding = InsituStatsEmbedding(
-            hidden_dim=hidden_dim,
-            stats_dim=4
-        )
-
-        # Condition Fusion
-        self.condition_fusion = nn.Sequential(
-            nn.Linear(hidden_dim * 4, hidden_dim * 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim * 2, hidden_dim)
-        )
-
-        # Residual Block
-        self.res_blocks = nn.ModuleList([
-            FiLMResBlock(hidden_dim=hidden_dim)
-            for _ in range(res_block_num)
-        ])
-
-        # Output Layer
-        self.output_layer = nn.Sequential(
-            nn.LayerNorm(hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1)
-        )
-
-    def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
-                pos: torch.Tensor, dates: List[str],
-                insitu_stats: torch.Tensor) -> torch.Tensor:
-        inputs = torch.cat([xs, diffused_ys], dim=1)
-        x = self.input_layer(inputs)
-
-        # Embed Timestep
-        embed_timesteps = self.timestep_embedding(timesteps)
-        embed_timesteps = self.emb_timestep2hidden(embed_timesteps)
-
-        # Embed Time
-        embed_time = self.time_embedding(dates)
-
-        # Embed Spatial
-        embed_spatial = self.spatial_embedding(pos)
-
-        # Embed Insitu Stats
-        embed_insitu_stats = self.insitu_stats_embedding(insitu_stats)
-
-        # Fuse Condition
-        condition = torch.cat([embed_timesteps, embed_time, embed_spatial, embed_insitu_stats], dim=1)
-        condition = self.condition_fusion(condition)
-
-        # Residual Blocks with FiLM
-        for res_block in self.res_blocks:
-            x = res_block(x, condition)
-
-        out = self.output_layer(x)
-
-        return out
+    model_save_path = os.path.join(CHECKPOINT_DIR_PATH, "DownscaleSM", "Diffusers")
+    model.save_pretrained(model_save_path)
 
 
 class Trainer:
 
-    def __init__(self, model: NoisePredictor, scheduler: DDPMScheduler,
-                 train_dataset: Dataset,
-                 val_dataset: Dataset,
-                 device: str,
-                 early_stopping: EarlyStopping,
-                 insitu_stats_store: InsituStatsStore,
-                 total_epoch: int,
-                 batch_size: int, lr: float):
+    def __init__(self, model: NoisePredictor,
+                 train_dataset: Dataset, val_dataset: Dataset, insitu_stats_store: InsituStatsStore):
         self.model = model
-        self.scheduler = scheduler
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
-        self.device = device
-        self.early_stopping = early_stopping
         self.insitu_stats_store = insitu_stats_store
-        self.total_epoch = total_epoch
-        self.batch_size = batch_size
-        self.lr = lr
+
+        self.scheduler = build_scheduler()
+        self.total_epoch = TOTAL_EPOCH
+        self.batch_size = BATCH_SIZE
+        self.lr = LR
+        self.device = build_device()
+        self.early_stopping = build_early_stopping()
+
+        self.model = model.to(self.device)
 
     def evaluate_epoch(self, data_loader: DataLoader, optimizer: torch.optim.Optimizer = None) -> float:
         total_loss = 0.0
@@ -257,7 +116,7 @@ class Trainer:
                 insitu_stats=batch_insitu_stats
             )
 
-            diffusion_loss = nn.functional.mse_loss(pred_noise, noises)
+            diffusion_loss = F.mse_loss(pred_noise, noises)
             loss = diffusion_loss
 
             total_loss += loss.item() * B
@@ -347,121 +206,6 @@ def reverse_diffuse(model: NoisePredictor, scheduler: DDPMScheduler,
         ys = step_out.prev_sample
 
     return ys
-
-
-def correct_train(model: NoisePredictor, scheduler: DDPMScheduler, dataset: TrainDataset,
-                  insitu_stats_store: InsituStatsStore, device: str):
-    CORRECT_BATCH_SIZE = 16384
-    data_loader = DataLoader(dataset, batch_size=CORRECT_BATCH_SIZE, shuffle=False)
-
-    all_pred_ys, all_xs = [], []
-    with torch.no_grad():
-        for batch_xs, batch_true_ys, batch_pos, batch_dates in data_loader:
-            batch_xs = batch_xs.to(device)
-            batch_pos = batch_pos.to(device)
-            batch_insitu_stats = torch.stack([
-                torch.from_numpy(insitu_stats_store.get(date)).float()
-                for date in batch_dates
-            ]).to(device)
-
-            batch_pred_ys = reverse_diffuse(
-                model, scheduler, batch_xs, batch_pos, list(batch_dates), INFERENCE_STEP_NUM, device=device,
-                insitu_stats=batch_insitu_stats
-            )
-
-            all_pred_ys.append(batch_pred_ys)
-            all_xs.append(batch_xs)
-
-    pred_ys = torch.cat(all_pred_ys, dim=0)
-    xs = torch.cat(all_xs, dim=0)
-
-    # Denormalize
-    pred_ys = dataset.denorm_y(pred_ys)
-
-    pred_ys = pred_ys.cpu().numpy()
-    xs = xs.cpu().numpy()
-
-    # RF Bias Corrector
-    rf_corrector = BiasCorrector()
-    rf_corrector.train(
-        pred_ys=pred_ys,
-        insitus=dataset.insitus,
-        insitu_masks=dataset.insitu_masks,
-        aux_feats=xs
-    )
-
-
-def test(model: NoisePredictor, scheduler: DDPMScheduler, train_dataset: TrainDataset,
-         insitu_stats_store: InsituStatsStore, device: str):
-    TEST_BATCH_SIZE = 16384
-    data_loader = DataLoader(train_dataset, batch_size=TEST_BATCH_SIZE, shuffle=False)
-
-    all_pred_ys, all_true_ys, all_dates, all_xs = [], [], [], []
-    with torch.no_grad():
-        for batch_xs, batch_true_ys, batch_pos, batch_dates in data_loader:
-            batch_xs = batch_xs.to(device)
-            batch_pos = batch_pos.to(device)
-            batch_insitu_stats = torch.stack([
-                torch.from_numpy(insitu_stats_store.get(date)).float()
-                for date in batch_dates
-            ]).to(device)
-
-            batch_pred_ys = reverse_diffuse(
-                model, scheduler, batch_xs, batch_pos, list(batch_dates), INFERENCE_STEP_NUM, device=device,
-                insitu_stats=batch_insitu_stats
-            )
-
-            all_pred_ys.append(batch_pred_ys)
-            all_true_ys.append(batch_true_ys.to(device))
-            all_dates.extend(list(batch_dates))
-            all_xs.append(batch_xs)
-
-    pred_ys = torch.cat(all_pred_ys, dim=0)
-    true_ys = torch.cat(all_true_ys, dim=0)
-    xs = torch.cat(all_xs, dim=0)
-
-    # Denormalize
-    pred_ys = train_dataset.denorm_y(pred_ys)
-    pred_ys = pred_ys.cpu().numpy()
-    true_ys = train_dataset.denorm_y(true_ys)
-    true_ys = true_ys.cpu().numpy()
-
-    insitus = train_dataset.insitus
-    insitu_masks = train_dataset.insitu_masks
-    rows = train_dataset.rows
-    cols = train_dataset.cols
-
-    # Load Bias Corrector (already trained)
-    rf_corrector = BiasCorrector()
-    pred_ys = rf_corrector.predict(
-        pred_ys=pred_ys,
-        aux_feats=xs.cpu().numpy()
-    )
-    pred_ys = np.clip(pred_ys, SM_MIN, SM_MAX)
-
-    # Evaluate corrected predictions only
-    evaluator = Evaluator(min_site_num=2, min_date_num=2)
-
-    print("\n" + "=" * 60)
-    print("Evaluation by Date: Corrected Predictions vs InSitu Data")
-    print("=" * 60)
-
-    df_result_date = evaluator.evaluate_by_date(pred_ys, insitus, insitu_masks, all_dates, true_ys=true_ys)
-    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Date_Test.csv")
-    df_result_date.to_csv(dst_file_path, index=False)
-
-    print("\n" + "=" * 60)
-    print("Evaluation by Site: Corrected Predictions vs InSitu Data")
-    print("=" * 60)
-
-    df_result_site = evaluator.evaluate_by_site(pred_ys, insitus, insitu_masks, all_dates, rows, cols,
-                                                true_ys=true_ys)
-    dst_file_path = os.path.join(RESULT_DIR_PATH, "Evaluation_By_Site_Test.csv")
-    df_result_site.to_csv(dst_file_path, index=False)
-
-    # Evaluate by Spatial Distribution
-    grid_info = train_dataset.grid_info_store.get()
-    evaluator.evaluate_by_spatial_distribution(df_result_site, height=grid_info['H'], width=grid_info['W'])
 
 
 if __name__ == "__main__":

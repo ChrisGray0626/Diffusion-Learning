@@ -5,19 +5,119 @@
   @Author Chris
   @Date 2025/11/12
 """
-import os
 from datetime import datetime
 from typing import List
 
-import joblib
 import numpy as np
 import torch
+import torch.nn as nn
+from diffusers.configuration_utils import ConfigMixin, register_to_config
+from diffusers.models.modeling_utils import ModelMixin
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
-from torch import nn
 
-from Constant import CHECKPOINT_DIR_PATH
+from Constant import RANGE
+from Util.ModelHelper import SinusoidalPosEmb
+
+
+class NoisePredictor(ModelMixin, ConfigMixin):
+
+    @register_to_config
+    def __init__(self, input_feature_num: int,
+                 hidden_dim: int = 512, timestep_emb_dim: int = 128,
+                 res_block_num: int = 3):
+        super().__init__()
+        self.input_feature_num = input_feature_num
+        self.hidden_dim = hidden_dim
+
+        input_dim = input_feature_num + 1
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
+
+        # Timestep Embedding
+        self.timestep_embedding = nn.Sequential(
+            SinusoidalPosEmb(timestep_emb_dim),
+            nn.Linear(timestep_emb_dim, timestep_emb_dim * 4),
+            nn.SiLU(),
+            nn.Linear(timestep_emb_dim * 4, timestep_emb_dim * 4),
+        )
+        self.emb_timestep2hidden = nn.Linear(timestep_emb_dim * 4, hidden_dim)
+
+        # Time Embedding
+        self.time_embedding = TimeEmbedding(
+            hidden_dim=hidden_dim,
+            num_fourier=8
+        )
+
+        # Spatial Embedding
+        lon_min, lat_min, lon_max, lat_max = RANGE
+        self.spatial_embedding = SpatialEmbedding(
+            hidden_dim=hidden_dim,
+            num_fourier=6,
+            lon_min=lon_min,
+            lon_max=lon_max,
+            lat_min=lat_min,
+            lat_max=lat_max
+        )
+
+        # Insitu Stats Embedding
+        self.insitu_stats_embedding = InsituStatsEmbedding(
+            hidden_dim=hidden_dim,
+            stats_dim=4
+        )
+
+        # Condition Fusion
+        self.condition_fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 4, hidden_dim * 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim * 2, hidden_dim)
+        )
+
+        # Residual Block
+        self.res_blocks = nn.ModuleList([
+            FiLMResBlock(hidden_dim=hidden_dim)
+            for _ in range(res_block_num)
+        ])
+
+        # Output Layer
+        self.output_layer = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1)
+        )
+
+    def forward(self, diffused_ys: torch.Tensor, xs: torch.Tensor, timesteps: torch.Tensor,
+                pos: torch.Tensor, dates: List[str],
+                insitu_stats: torch.Tensor) -> torch.Tensor:
+        inputs = torch.cat([xs, diffused_ys], dim=1)
+        x = self.input_layer(inputs)
+
+        # Embed Timestep
+        embed_timesteps = self.timestep_embedding(timesteps)
+        embed_timesteps = self.emb_timestep2hidden(embed_timesteps)
+
+        # Embed Time
+        embed_time = self.time_embedding(dates)
+
+        # Embed Spatial
+        embed_spatial = self.spatial_embedding(pos)
+
+        # Embed Insitu Stats
+        embed_insitu_stats = self.insitu_stats_embedding(insitu_stats)
+
+        # Fuse Condition
+        condition = torch.cat([embed_timesteps, embed_time, embed_spatial, embed_insitu_stats], dim=1)
+        condition = self.condition_fusion(condition)
+
+        # Residual Blocks with FiLM
+        for res_block in self.res_blocks:
+            x = res_block(x, condition)
+
+        out = self.output_layer(x)
+
+        return out
 
 
 class TimeEmbedding(nn.Module):
@@ -122,32 +222,6 @@ class InsituStatsEmbedding(nn.Module):
         return self.proj(insitu_stats)
 
 
-class FiLM(nn.Module):
-
-    def __init__(self, hidden_dim: int):
-
-        super().__init__()
-        self.hidden_dim = hidden_dim
-
-        self.scale_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-        self.shift_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-
-    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
-        scale = self.scale_net(condition)
-        shift = self.shift_net(condition)
-        out = scale * x + shift
-
-        return out
-
-
 class FiLMResBlock(nn.Module):
 
     def __init__(self, hidden_dim: int):
@@ -170,70 +244,86 @@ class FiLMResBlock(nn.Module):
         return out
 
 
+class FiLM(nn.Module):
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        self.scale_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.shift_net = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
+
+    def forward(self, x: torch.Tensor, condition: torch.Tensor) -> torch.Tensor:
+        scale = self.scale_net(condition)
+        shift = self.shift_net(condition)
+        out = scale * x + shift
+
+        return out
+
+
 class BiasCorrector:
 
-    def __init__(self, model_name: str = "rf_bias_corrector", n_estimators: int = 300, max_depth: int = None,
+    def __init__(self, n_estimators: int = 300, max_depth: int = None,
                  max_features: int = 4, random_state: int = 42):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.max_features = max_features
         self.random_state = random_state
         self.model = None
-        self.model_dir = os.path.join(CHECKPOINT_DIR_PATH, "DownscaleSM", "RF")
-        self.model_path = os.path.join(self.model_dir, f"{model_name}.joblib")
 
-        if os.path.exists(self.model_path):
-            self.load()
-
-    def train(self, pred_ys: np.ndarray, insitus: np.ndarray, insitu_masks: np.ndarray,
-              aux_feats: np.ndarray):
-        valid_mask = insitu_masks > 0
-        pred_ys = pred_ys[valid_mask]
-        insitus = insitus[valid_mask]
-        aux_feats = aux_feats[valid_mask]
-
+    def train(self, pred_ys: np.ndarray, insitus: np.ndarray,
+              aux_feats: np.ndarray, verbose: bool = True):
         X = np.column_stack([pred_ys, aux_feats]).astype(np.float32)
         y = insitus.astype(np.float32)
 
-        # 划分训练集和验证集
-        x_train, x_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.2, random_state=self.random_state
-        )
+        # 如果样本数太少，使用全部数据训练；否则划分训练集和验证集
+        if len(X) < 50:
+            x_train, y_train = X, y
+            x_val, y_val = X, y
+        else:
+            x_train, x_val, y_train, y_val = train_test_split(
+                X, y, test_size=0.2, random_state=self.random_state
+            )
 
-        # 训练随机森林模型
+        # 根据样本数调整模型参数
+        n_samples = len(x_train)
+        n_est = min(self.n_estimators, max(50, n_samples // 10))
+
         self.model = RandomForestRegressor(
-            n_estimators=self.n_estimators,
+            n_estimators=n_est,
             max_depth=self.max_depth,
             max_features=self.max_features,
             n_jobs=-1,
             random_state=self.random_state,
-            oob_score=True
+            oob_score=n_samples > 50
         )
         self.model.fit(x_train, y_train)
 
-        y_pred_val = self.model.predict(x_val)
-        mse = mean_squared_error(y_val, y_pred_val)
-        rmse = np.sqrt(mse)
-        r2 = r2_score(y_val, y_pred_val)
+        if verbose:
+            y_pred_val = self.model.predict(x_val)
+            mse = mean_squared_error(y_val, y_pred_val)
+            rmse = np.sqrt(mse)
+            r2 = r2_score(y_val, y_pred_val)
 
-        print(f"\nRF Bias Corrector Training:")
-        print(f"  Training samples: {len(x_train):,}, Validation samples: {len(x_val):,}")
-        print(f"  Validation RMSE: {rmse:.6f}, R2: {r2:.4f}")
-        print(f"  OOB Score: {self.model.oob_score_:.4f}")
+            print(f"RF Bias Corrector Training:")
+            print(f"  Training samples: {len(x_train):,}, Validation samples: {len(x_val):,}")
+            print(f"  Validation RMSE: {rmse:.6f}, R2: {r2:.4f}")
+            if hasattr(self.model, 'oob_score_') and self.model.oob_score_ is not None:
+                print(f"  OOB Score: {self.model.oob_score_:.4f}")
 
-        # Save Model
-        os.makedirs(self.model_dir, exist_ok=True)
-        joblib.dump(self.model, self.model_path)
-
-        return self.model
-
-    def load(self):
-        if not os.path.exists(self.model_path):
-            raise FileNotFoundError(f"RF bias corrector model not found: {self.model_path}")
-
-        self.model = joblib.load(self.model_path)
         return self.model
 
     def predict(self, pred_ys: np.ndarray, aux_feats: np.ndarray) -> np.ndarray:
+        if self.model is None:
+            raise RuntimeError("Model not trained. Call train() first.")
+
         X = np.column_stack([pred_ys, aux_feats]).astype(np.float32)
         return self.model.predict(X).astype(np.float32)
