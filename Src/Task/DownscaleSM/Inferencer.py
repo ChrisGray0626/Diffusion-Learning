@@ -21,7 +21,7 @@ from Util.Util import get_valid_dates, build_device
 INFERENCE_STEP_NUM = 50
 BATCH_SIZE = 16384
 
-RESOLUTION = RESOLUTION_1KM
+RESOLUTION = RESOLUTION_36KM
 
 
 def main():

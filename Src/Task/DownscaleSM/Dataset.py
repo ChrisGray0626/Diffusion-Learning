@@ -210,32 +210,32 @@ class CorrectionDataset(Dataset):
         self._norm()
 
     def _load_data(self):
-        # Load inference result
         pred_map = self.inference_result_store.get(self.date)
 
-        # Load auxiliary features
         xs = np.stack([
             self.data_store.get(name, self.date) for name in
             [NDVI_NAME, LST_NAME, ALBEDO_NAME, PRECIPITATION_NAME, DEM_NAME]
         ], axis=-1)
 
+        insitu_map = self.data_store.get(IN_SITU_NAME, self.date)
+
         grid_info = self.grid_info_store.get()
         H, W = grid_info["H"], grid_info["W"]
 
-        # Flatten prediction map and auxiliary features
-        self.pred_map = pred_map.astype(np.float32)  # Keep as 2D for indexing
+        self.pred_map = pred_map.astype(np.float32)
         self.xs = xs.reshape(H * W, -1).astype(np.float32)
+        self.insitu = insitu_map.flatten().astype(np.float32)
         self.grid_info = grid_info
         self.rows_full = grid_info["rows"].flatten()
         self.cols_full = grid_info["cols"].flatten()
 
     def _filter_valid(self):
         valid = ~np.isnan(self.xs).any(axis=1)
-        self.valid_indices = np.where(valid)[0]
 
         self.xs = self.xs[valid]
         self.rows = self.rows_full[valid]
         self.cols = self.cols_full[valid]
+        self.insitu = self.insitu[valid]
 
     def _norm(self):
         x_mean = self.train_dataset.x_mean

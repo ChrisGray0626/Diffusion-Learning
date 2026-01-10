@@ -7,11 +7,11 @@
 """
 import os
 
-from Constant import RESULT_DIR_PATH, RESOLUTION_1KM
+from Constant import RESULT_DIR_PATH, RESOLUTION_36KM
 from Task.DownscaleSM.Dataset import ResultEvaluationDataset
 from Task.DownscaleSM.Evaluator import Evaluator
 
-RESOLUTION = RESOLUTION_1KM
+RESOLUTION = RESOLUTION_36KM
 
 
 def main():
@@ -19,6 +19,11 @@ def main():
     evaluator = Evaluator(min_site_num=2, min_date_num=2)
 
     pred_map, insitu_map, insitu_masks, dates, rows, cols = dataset.get_all()
+
+    # Overall Evaluation
+    evaluator.print_overall(pred_map, insitu_map, insitu_masks,
+                            title=f"Overall Evaluation: {RESOLUTION} Correction Results vs InSitu Data")
+
     # Evaluate by Date
     print("\n" + "=" * 60)
     print(f"Evaluation by Date: {RESOLUTION} Correction Results vs InSitu Data")

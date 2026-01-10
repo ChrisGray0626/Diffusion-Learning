@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-@Description Evaluator for Soil Moisture Downscaling Results
-@Author Chris
-@Date 2025/12/12
-"""
-
 from typing import List, Optional
 
 import matplotlib.pyplot as plt
@@ -40,7 +32,6 @@ class Evaluator:
         df_result = pd.DataFrame(
             df.groupby('Date').apply(self._calc_metrics_by_date, include_groups=False).dropna().tolist())
         df_result = df_result.sort_values('InSitu_Corr_R2', ascending=False, na_position='last')
-
         return df_result
 
     def _calc_metrics_by_date(self, group):
@@ -48,20 +39,17 @@ class Evaluator:
         insitu = group['Insitu'].values
         insitu_mask = group['InsituMask'].values
 
-        valid_insitu_count = insitu_mask.sum()
-
-        if valid_insitu_count < self.min_site_num:
+        if insitu_mask.sum() < self.min_site_num:
             return None
 
         result = {
             'Date': group.name,
             'Total_Points': len(group),
-            'Valid_InSitu_Points': int(valid_insitu_count)
+            'Valid_InSitu_Points': int(insitu_mask.sum())
         }
 
         if 'TrueY' in group.columns:
-            true_y = group['TrueY'].values
-            true_y_metrics = self._calc_metrics(pred_y, true_y)
+            true_y_metrics = self._calc_metrics(pred_y, group['TrueY'].values)
             result.update({f'TrueY_{k}': v for k, v in true_y_metrics.items()})
 
         insitu_orig_metrics = self._calc_metrics(pred_y, insitu, insitu_mask)
@@ -72,7 +60,6 @@ class Evaluator:
         pred_corrected = pred_y - systematic_bias
         insitu_corr_metrics = self._calc_metrics(pred_corrected, insitu, insitu_mask)
         result.update({f'InSitu_Corr_{k}': v for k, v in insitu_corr_metrics.items()})
-
         return result
 
     def evaluate_by_site(self, pred_ys: np.ndarray, insitus: np.ndarray,
@@ -100,12 +87,10 @@ class Evaluator:
 
         df = pd.DataFrame(data_dict)
         df_with_insitu = df[df['InsituMask'] > 0].copy()
-
         results = df_with_insitu.groupby(['Row', 'Col']).apply(self._calc_metrics_by_site,
                                                                include_groups=False).dropna()
         df_result = pd.DataFrame(list(results))
         df_result = df_result.sort_values('InSitu_Corr_R2', ascending=False, na_position='last')
-
         return df_result
 
     def _calc_metrics_by_site(self, group):
@@ -113,21 +98,18 @@ class Evaluator:
         insitu = group['Insitu'].values
         insitu_mask = group['InsituMask'].values
 
-        valid_dates_count = len(group)
-
-        if valid_dates_count < self.min_date_num:
+        if len(group) < self.min_date_num:
             return None
 
         row, col = group.name
         result = {
             'Row': int(row),
             'Col': int(col),
-            'Valid_InSitu_Dates': valid_dates_count
+            'Valid_InSitu_Dates': len(group)
         }
 
         if 'TrueY' in group.columns:
-            true_y = group['TrueY'].values
-            true_y_metrics = self._calc_metrics(pred_y, true_y)
+            true_y_metrics = self._calc_metrics(pred_y, group['TrueY'].values)
             result.update({f'TrueY_{k}': v for k, v in true_y_metrics.items()})
 
         insitu_orig_metrics = self._calc_metrics(pred_y, insitu, insitu_mask)
@@ -138,7 +120,6 @@ class Evaluator:
         pred_corrected = pred_y - systematic_bias
         insitu_corr_metrics = self._calc_metrics(pred_corrected, insitu, insitu_mask)
         result.update({f'InSitu_Corr_{k}': v for k, v in insitu_corr_metrics.items()})
-
         return result
 
     @staticmethod
@@ -171,7 +152,7 @@ class Evaluator:
 
         if use_scatter:
             scatter1 = ax1.scatter(cols, rows, c=error_values, cmap='YlOrRd', s=50, edgecolors='black', linewidths=0.5)
-            ax1.set_title(f'ubRMSE (Pred vs InSitu)')
+            ax1.set_title('ubRMSE (Pred vs InSitu)')
             ax1.set_xlabel('Column Index')
             ax1.set_ylabel('Row Index')
             ax1.set_aspect('equal', adjustable='box')
@@ -179,7 +160,7 @@ class Evaluator:
 
             scatter2 = ax2.scatter(cols, rows, c=r2_values, cmap='cividis', s=50, edgecolors='black', linewidths=0.5,
                                    vmin=0, vmax=1)
-            ax2.set_title(f'R² Score (Pred vs InSitu)')
+            ax2.set_title('R² Score (Pred vs InSitu)')
             ax2.set_xlabel('Column Index')
             ax2.set_ylabel('Row Index')
             ax2.set_aspect('equal', adjustable='box')
@@ -212,9 +193,46 @@ class Evaluator:
             metric_grid[rows[i], cols[i]] = metric_values[i]
         return metric_grid
 
-    @staticmethod
-    def print_result(df_results: pd.DataFrame):
-        pd.set_option('display.max_columns', None)
-        pd.set_option('display.width', None)
-        pd.set_option('display.max_colwidth', None)
-        print(df_results.to_string(index=False))
+    def evaluate_overall(self, pred_ys: np.ndarray, insitus: np.ndarray,
+                         insitu_masks: np.ndarray) -> dict:
+        pred_ys = pred_ys.flatten() if pred_ys.ndim > 1 else pred_ys
+        insitus = insitus.flatten() if insitus.ndim > 1 else insitus
+        insitu_masks = insitu_masks.flatten() if insitu_masks.ndim > 1 else insitu_masks
+
+        valid_mask = insitu_masks > 0
+        pred_valid = pred_ys[valid_mask]
+        insitu_valid = insitus[valid_mask]
+
+        if len(pred_valid) == 0:
+            return {'Error': 'No valid in-situ data points'}
+
+        metrics = self._calc_metrics(pred_valid, insitu_valid)
+        n_valid = len(pred_valid)
+        mse = np.mean((pred_valid - insitu_valid) ** 2)
+        rmse = np.sqrt(mse)
+
+        return {
+            'Total_Valid_Points': n_valid,
+            'RMSE': rmse,
+            **metrics
+        }
+
+    def print_overall(self, pred_ys: np.ndarray, insitus: np.ndarray,
+                      insitu_masks: np.ndarray, title: str = "Overall Evaluation"):
+        metrics = self.evaluate_overall(pred_ys, insitus, insitu_masks)
+
+        if 'Error' in metrics:
+            print(f"\n{title}: {metrics['Error']}")
+            return
+
+        print(f"\n{'=' * 60}")
+        print(f"{title}")
+        print(f"{'=' * 60}")
+        print(f"Total Valid In-Situ Points: {metrics['Total_Valid_Points']:,}")
+        print(f"\nMetrics:")
+        print(f"  RMSE:      {metrics['RMSE']:.6f}")
+        print(f"  ubRMSE:    {metrics['ubRMSE']:.6f}")
+        print(f"  Bias:      {metrics['Bias']:.6f}")
+        print(f"  R²:        {metrics['R2']:.4f}")
+        print(f"  Slope:     {metrics['Slope']:.4f}")
+        print(f"{'=' * 60}")

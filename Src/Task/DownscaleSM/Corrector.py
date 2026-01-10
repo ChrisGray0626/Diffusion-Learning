@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from Constant import *
-from Task.DownscaleSM.Dataset import InferenceDataset, CorrectionDataset, GridInfoStore
+from Task.DownscaleSM.Dataset import CorrectionDataset, GridInfoStore
 from Task.DownscaleSM.Module import BiasCorrector
 from Util.TiffUtil import write_tiff
 from Util.Util import get_valid_dates
@@ -35,20 +35,15 @@ def main():
 
     dates = get_valid_dates()
     for date in tqdm(dates, desc="Collecting"):
-        inference_dataset = InferenceDataset(date=date, resolution=RESOLUTION)
+        correction_dataset = CorrectionDataset(date=date, resolution=RESOLUTION)
 
-        # Load inference result from InferenceResultStore
-        from Task.DownscaleSM.Dataset import InferenceResultStore
-        inference_result_store = InferenceResultStore(resolution=RESOLUTION)
-        pred_map = inference_result_store.get(date)
-        pred_ys = pred_map[inference_dataset.rows, inference_dataset.cols]
+        pred_ys = correction_dataset.pred_map[correction_dataset.rows, correction_dataset.cols]
 
-        # Collect in-situ data for training
-        insitu_mask = inference_dataset.insitu_mask > 0
+        insitu_mask = ~np.isnan(correction_dataset.insitu)
         if insitu_mask.sum() > 0:
             all_pred_ys_insitu.append(pred_ys[insitu_mask])
-            all_insitus.append(inference_dataset.insitu[insitu_mask])
-            all_aux_feats_insitu.append(inference_dataset.xs[insitu_mask])
+            all_insitus.append(correction_dataset.insitu[insitu_mask])
+            all_aux_feats_insitu.append(correction_dataset.xs[insitu_mask])
 
     # Train Bias Corrector
     all_pred_ys_insitu_concat = np.concatenate(all_pred_ys_insitu)
@@ -62,10 +57,6 @@ def main():
         aux_feats=all_aux_feats_insitu_concat,
         verbose=True
     )
-
-    # Release Memory
-    del all_pred_ys_insitu, all_insitus, all_aux_feats_insitu
-    del all_pred_ys_insitu_concat, all_insitus_concat, all_aux_feats_insitu_concat
 
     # Correction
     for date in tqdm(dates, desc="Correction"):

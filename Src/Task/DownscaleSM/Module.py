@@ -284,17 +284,11 @@ class BiasCorrector:
         X = np.column_stack([pred_ys, aux_feats]).astype(np.float32)
         y = insitus.astype(np.float32)
 
-        # 如果样本数太少，使用全部数据训练；否则划分训练集和验证集
-        if len(X) < 50:
-            x_train, y_train = X, y
-            x_val, y_val = X, y
-        else:
-            x_train, x_val, y_train, y_val = train_test_split(
-                X, y, test_size=0.2, random_state=self.random_state
-            )
+        x_train, x_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=self.random_state
+        )
 
-        # 根据样本数调整模型参数
-        n_samples = len(x_train)
+        n_samples = len(X)
         n_est = min(self.n_estimators, max(50, n_samples // 10))
 
         self.model = RandomForestRegressor(
@@ -305,7 +299,7 @@ class BiasCorrector:
             random_state=self.random_state,
             oob_score=n_samples > 50
         )
-        self.model.fit(x_train, y_train)
+        self.model.fit(X, y)
 
         if verbose:
             y_pred_val = self.model.predict(x_val)
